@@ -63,7 +63,7 @@ struct AppConfig {
             volcengineAPIKey: "",
             resourceID: supportedResourceIDs[0],
             pairedDeviceIDs: [],
-            autoEnter: false,
+            autoEnter: true,
             debugAudioCache: false,
             debugAudioDirectory: defaultDebugAudioDirectory
         )

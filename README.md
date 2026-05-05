@@ -2,7 +2,7 @@
 
 Voice Stick turns an M5Stack StickS3 into a Bluetooth push-to-talk input device for macOS.
 
-Hold the front button on the StickS3 to record. When you release it, the macOS menu bar app sends the audio to ASR, shows the recognized text, and pastes the final result into the currently focused input field after a short confirmation countdown. By default it only pastes text and does not press Return; `auto_enter` can be enabled in settings.
+Hold the front button on the StickS3 to record. When you release it, the macOS menu bar app sends the audio to ASR, shows the recognized text, and pastes the final result into the currently focused input field after a short confirmation countdown. By default it pastes text and presses Return; `auto_enter` can be disabled in settings.
 
 ## Project Layout
 
@@ -54,7 +54,7 @@ The firmware reports raw button facts (`button_down` / `button_up` with
 `primary` or `secondary`). The macOS app owns the interaction state machine and
 sends `ui_state` updates back to the firmware for the screen.
 
-By default the paste flow does not press Return. Enable `Press Return after paste` in settings, or set `auto_enter = true` in the config file, to send Return after paste.
+By default the paste flow presses Return after paste. Disable `Press Return after paste` in settings, or set `auto_enter = false` in the config file, to paste without sending Return.
 
 ## Audio Path
 
@@ -181,7 +181,7 @@ voicestick_cloud_url = "wss://api.xiaozhi.me/voicestick/asr/"
 volcengine_api_key = "your_volcengine_asr_api_key"
 resource_id = "volc.seedasr.sauc.duration"
 paired_device_ids = ""
-auto_enter = false
+auto_enter = true
 debug_audio_cache = false
 # debug_audio_dir = "~/Library/Application Support/VoiceStick/DebugAudio"
 ```
