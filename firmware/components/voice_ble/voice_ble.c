@@ -7,6 +7,7 @@
 #include <sys/param.h>
 
 #include "esp_check.h"
+#include "esp_app_desc.h"
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_ota_ops.h"
@@ -38,6 +39,7 @@ static uint16_t s_ota_state_attr_handle;
 static char s_device_id[5] = "0000";
 static char s_device_name[8] = VOICE_BLE_DEVICE_NAME_PREFIX "-0000";
 static voice_ble_connection_cb_t s_connection_cb;
+static voice_ble_control_cb_t s_control_cb;
 static voice_ble_ota_cb_t s_ota_cb;
 
 typedef struct {
@@ -357,7 +359,7 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
         return BLE_ATT_ERR_UNLIKELY;
     }
 
-    char buffer[128] = {0};
+    char buffer[512] = {0};
     const uint16_t len = OS_MBUF_PKTLEN(ctxt->om);
     const uint16_t copy_len = MIN(len, sizeof(buffer) - 1);
     int rc = ble_hs_mbuf_to_flat(ctxt->om, buffer, copy_len, NULL);
@@ -366,6 +368,9 @@ static int control_access_cb(uint16_t conn_handle, uint16_t attr_handle,
     }
 
     ESP_LOGD(TAG, "control %s", buffer);
+    if (s_control_cb) {
+        s_control_cb(buffer);
+    }
     return 0;
 }
 
@@ -462,6 +467,10 @@ static int gap_event_cb(struct ble_gap_event *event, void *arg)
     case BLE_GAP_EVENT_SUBSCRIBE:
         ESP_LOGD(TAG, "subscribe attr=%u notify=%d",
                  event->subscribe.attr_handle, event->subscribe.cur_notify);
+        if (event->subscribe.attr_handle == s_state_attr_handle &&
+            event->subscribe.cur_notify) {
+            (void)voice_ble_send_device_info();
+        }
         return 0;
 
     case BLE_GAP_EVENT_MTU:
@@ -622,6 +631,11 @@ void voice_ble_set_connection_callback(voice_ble_connection_cb_t callback)
     s_connection_cb = callback;
 }
 
+void voice_ble_set_control_callback(voice_ble_control_cb_t callback)
+{
+    s_control_cb = callback;
+}
+
 void voice_ble_set_ota_callback(voice_ble_ota_cb_t callback)
 {
     s_ota_cb = callback;
@@ -724,21 +738,48 @@ static esp_err_t send_state_json(const char *json)
     return ESP_OK;
 }
 
-esp_err_t voice_ble_send_press_start(uint32_t session_id)
+esp_err_t voice_ble_send_device_info(void)
 {
-    char json[80];
-    snprintf(json, sizeof(json), "{\"event\":\"press_start\",\"session_id\":%" PRIu32 "}", session_id);
+    const esp_app_desc_t *app_desc = esp_app_get_description();
+    const char *version = app_desc ? app_desc->version : "unknown";
+    char json[220];
+    snprintf(json, sizeof(json),
+             "{\"event\":\"device_info\",\"hardware\":\"stick_s3\","
+             "\"firmware_version\":\"%s\","
+             "\"buttons\":[\"primary\",\"secondary\"],"
+             "\"ui_states\":[\"ready\",\"recording\",\"thinking\","
+             "\"pending_confirmation\",\"error\"]}",
+             version);
     return send_state_json(json);
 }
 
-esp_err_t voice_ble_send_press_end(uint32_t session_id)
+esp_err_t voice_ble_send_button_down(const char *button, uint32_t session_id)
 {
-    char json[80];
-    snprintf(json, sizeof(json), "{\"event\":\"press_end\",\"session_id\":%" PRIu32 "}", session_id);
+    char json[96];
+    if (session_id > 0) {
+        snprintf(json, sizeof(json),
+                 "{\"event\":\"button_down\",\"button\":\"%s\",\"session_id\":%" PRIu32 "}",
+                 button, session_id);
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"event\":\"button_down\",\"button\":\"%s\"}", button);
+    }
     return send_state_json(json);
 }
 
-esp_err_t voice_ble_send_cancel(void)
+esp_err_t voice_ble_send_button_up(const char *button, uint32_t duration_ms,
+                                   uint32_t session_id)
 {
-    return send_state_json("{\"event\":\"cancel\"}");
+    char json[128];
+    if (session_id > 0) {
+        snprintf(json, sizeof(json),
+                 "{\"event\":\"button_up\",\"button\":\"%s\","
+                 "\"duration_ms\":%" PRIu32 ",\"session_id\":%" PRIu32 "}",
+                 button, duration_ms, session_id);
+    } else {
+        snprintf(json, sizeof(json),
+                 "{\"event\":\"button_up\",\"button\":\"%s\",\"duration_ms\":%" PRIu32 "}",
+                 button, duration_ms);
+    }
+    return send_state_json(json);
 }

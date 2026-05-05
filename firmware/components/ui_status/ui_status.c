@@ -163,6 +163,15 @@ static void apply_scene_locked(ui_status_icon_scene_t scene, const char *status,
 
     lv_label_set_text(s_status_label, status);
     lv_label_set_text(s_hint_label, hint ? hint : "");
+    if (scene == UI_STATUS_ICON_ERROR) {
+        lv_obj_set_height(s_hint_label, 42);
+        lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_DOT);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    } else {
+        lv_obj_set_height(s_hint_label, LV_SIZE_CONTENT);
+        lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_WRAP);
+        lv_obj_align(s_hint_label, LV_ALIGN_BOTTOM_MID, 0, -10);
+    }
 
     const bool resting = scene == UI_STATUS_ICON_RESTING;
     const bool pairing = scene == UI_STATUS_ICON_PAIRING || scene == UI_STATUS_ICON_BOOT;
@@ -452,5 +461,5 @@ void ui_status_set_ota_rebooting(void)
 void ui_status_set_error(const char *message)
 {
     ESP_LOGE(TAG, "%s", message ? message : "unknown error");
-    set_scene(UI_STATUS_ICON_ERROR, "Oops", message ? message : "Unknown error");
+    set_scene(UI_STATUS_ICON_ERROR, "", message ? message : "Unknown error");
 }

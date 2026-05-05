@@ -1,11 +1,13 @@
 #include <stdbool.h>
 #include <stdint.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
 
 #include "button_gpio.h"
+#include "cJSON.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_pm.h"
@@ -45,11 +47,26 @@ static uint32_t s_session_id = 1;
 static QueueHandle_t s_app_event_queue;
 static button_handle_t s_front_button;
 static button_handle_t s_side_button;
+static int64_t s_primary_down_us;
+static int64_t s_secondary_down_us;
+static uint32_t s_primary_session_id;
+
+typedef enum {
+    APP_UI_STATE_READY,
+    APP_UI_STATE_RECORDING,
+    APP_UI_STATE_THINKING,
+    APP_UI_STATE_PENDING_CONFIRMATION,
+    APP_UI_STATE_ERROR,
+} app_ui_state_t;
+
+static app_ui_state_t s_app_ui_state = APP_UI_STATE_READY;
 
 typedef enum {
     APP_EVENT_FRONT_DOWN,
     APP_EVENT_FRONT_UP,
     APP_EVENT_SIDE_DOWN,
+    APP_EVENT_SIDE_UP,
+    APP_EVENT_UI_STATE,
     APP_EVENT_BLE_CONNECTED,
     APP_EVENT_BLE_DISCONNECTED,
     APP_EVENT_POWER_IRQ,
@@ -65,11 +82,14 @@ typedef struct {
     app_event_type_t type;
     uint32_t written;
     uint32_t size;
+    char state[32];
+    char text[96];
 } app_event_t;
 
 static void update_battery_status(void);
 static void queue_app_event(app_event_type_t type);
 static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, uint32_t size);
+static void queue_ui_state_event(const char *state, const char *text);
 
 static bool is_external_powered(void)
 {
@@ -245,11 +265,11 @@ static void enter_deep_sleep(void)
     esp_deep_sleep_start();
 }
 
-static void start_recording(void)
+static uint32_t start_recording(void)
 {
     if (s_recording || s_ota_updating || voice_ble_ota_is_active() ||
-        !voice_ble_is_connected()) {
-        return;
+        !voice_ble_is_connected() || s_app_ui_state != APP_UI_STATE_READY) {
+        return 0;
     }
 
     const uint32_t session_id = s_session_id++;
@@ -257,7 +277,7 @@ static void start_recording(void)
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "acquire recording pm locks failed: %s", esp_err_to_name(err));
         ui_status_set_error("Power lock failed");
-        return;
+        return 0;
     }
 
     err = audio_pipeline_start(session_id);
@@ -265,29 +285,30 @@ static void start_recording(void)
         ESP_LOGE(TAG, "audio start failed: %s", esp_err_to_name(err));
         release_recording_pm_locks();
         ui_status_set_error("Audio start failed");
-        return;
+        return 0;
     }
 
     s_recording = true;
+    s_app_ui_state = APP_UI_STATE_RECORDING;
     restart_display_dim_timer();
     restart_deep_sleep_timer();
     ui_status_set_recording(session_id);
-    voice_ble_send_press_start(session_id);
+    return session_id;
 }
 
-static void stop_recording(void)
+static uint32_t stop_recording(void)
 {
     if (!s_recording) {
-        return;
+        return 0;
     }
 
+    const uint32_t session_id = audio_pipeline_session_id();
     s_recording = false;
     audio_pipeline_stop();
-    voice_ble_send_press_end(audio_pipeline_session_id());
     release_recording_pm_locks();
-    ui_status_set_idle();
     restart_display_dim_timer();
     restart_deep_sleep_timer();
+    return session_id;
 }
 
 static void queue_app_event(app_event_type_t type)
@@ -319,6 +340,24 @@ static void queue_app_event_from_isr(app_event_type_t type, BaseType_t *high_tas
     }
 }
 
+static void queue_ui_state_event(const char *state, const char *text)
+{
+    if (!s_app_event_queue) {
+        return;
+    }
+
+    app_event_t event = {
+        .type = APP_EVENT_UI_STATE,
+    };
+    if (state) {
+        strlcpy(event.state, state, sizeof(event.state));
+    }
+    if (text) {
+        strlcpy(event.text, text, sizeof(event.text));
+    }
+    (void)xQueueSend(s_app_event_queue, &event, 0);
+}
+
 static void front_button_down_cb(void *button_handle, void *usr_data)
 {
     (void)button_handle;
@@ -340,9 +379,70 @@ static void side_button_down_cb(void *button_handle, void *usr_data)
     queue_app_event(APP_EVENT_SIDE_DOWN);
 }
 
+static void side_button_up_cb(void *button_handle, void *usr_data)
+{
+    (void)button_handle;
+    (void)usr_data;
+    queue_app_event(APP_EVENT_SIDE_UP);
+}
+
 static void ble_connection_cb(bool connected)
 {
     queue_app_event(connected ? APP_EVENT_BLE_CONNECTED : APP_EVENT_BLE_DISCONNECTED);
+}
+
+static void ble_control_cb(const char *json)
+{
+    cJSON *root = cJSON_Parse(json);
+    if (!root) {
+        ESP_LOGW(TAG, "ignore invalid control json");
+        return;
+    }
+
+    const cJSON *event = cJSON_GetObjectItemCaseSensitive(root, "event");
+    const cJSON *state = cJSON_GetObjectItemCaseSensitive(root, "state");
+    const cJSON *text = cJSON_GetObjectItemCaseSensitive(root, "text");
+    if (cJSON_IsString(event) && strcmp(event->valuestring, "ui_state") == 0 &&
+        cJSON_IsString(state)) {
+        queue_ui_state_event(state->valuestring, cJSON_IsString(text) ? text->valuestring : "");
+    }
+    cJSON_Delete(root);
+}
+
+static uint32_t elapsed_button_ms(int64_t down_us)
+{
+    if (down_us <= 0) {
+        return 0;
+    }
+    int64_t elapsed_us = esp_timer_get_time() - down_us;
+    if (elapsed_us < 0) {
+        elapsed_us = 0;
+    }
+    return (uint32_t)(elapsed_us / 1000);
+}
+
+static void apply_app_ui_state(const char *state, const char *text)
+{
+    if (strcmp(state, "ready") == 0) {
+        s_app_ui_state = APP_UI_STATE_READY;
+        ui_status_set_idle();
+    } else if (strcmp(state, "recording") == 0) {
+        s_app_ui_state = APP_UI_STATE_RECORDING;
+        if (!s_recording) {
+            ui_status_set_recording(0);
+        }
+    } else if (strcmp(state, "thinking") == 0) {
+        s_app_ui_state = APP_UI_STATE_THINKING;
+        ui_status_set_partial_text("");
+    } else if (strcmp(state, "pending_confirmation") == 0) {
+        s_app_ui_state = APP_UI_STATE_PENDING_CONFIRMATION;
+        ui_status_set_partial_text("Confirm or cancel");
+    } else if (strcmp(state, "error") == 0) {
+        s_app_ui_state = APP_UI_STATE_ERROR;
+        ui_status_set_error(text && text[0] ? text : "Unknown error");
+    } else {
+        ESP_LOGW(TAG, "unknown ui_state %s", state);
+    }
 }
 
 static void ble_ota_cb(voice_ble_ota_event_t event, uint32_t written, uint32_t size)
@@ -376,24 +476,41 @@ static void app_event_task(void *arg)
         switch (event.type) {
         case APP_EVENT_FRONT_DOWN:
             note_activity();
-            start_recording();
+            s_primary_down_us = esp_timer_get_time();
+            s_primary_session_id = start_recording();
+            voice_ble_send_button_down("primary", s_primary_session_id);
             break;
         case APP_EVENT_FRONT_UP:
             note_activity();
-            stop_recording();
+            const uint32_t primary_duration_ms = elapsed_button_ms(s_primary_down_us);
+            if (s_recording) {
+                s_primary_session_id = stop_recording();
+            }
+            voice_ble_send_button_up("primary", primary_duration_ms, s_primary_session_id);
+            s_primary_down_us = 0;
+            s_primary_session_id = 0;
             break;
         case APP_EVENT_SIDE_DOWN:
             note_activity();
-            if (!s_recording) {
-                voice_ble_send_cancel();
-            }
+            s_secondary_down_us = esp_timer_get_time();
+            voice_ble_send_button_down("secondary", 0);
+            break;
+        case APP_EVENT_SIDE_UP:
+            note_activity();
+            voice_ble_send_button_up("secondary", elapsed_button_ms(s_secondary_down_us), 0);
+            s_secondary_down_us = 0;
+            break;
+        case APP_EVENT_UI_STATE:
+            apply_app_ui_state(event.state, event.text);
             break;
         case APP_EVENT_BLE_CONNECTED:
+            s_app_ui_state = APP_UI_STATE_READY;
             ui_status_set_idle();
             break;
         case APP_EVENT_BLE_DISCONNECTED:
             s_recording = false;
             s_ota_updating = false;
+            s_app_ui_state = APP_UI_STATE_READY;
             audio_pipeline_stop();
             release_recording_pm_locks();
             release_ota_pm_locks();
@@ -409,10 +526,9 @@ static void app_event_task(void *arg)
         case APP_EVENT_OTA_BEGIN:
             s_ota_updating = true;
             if (s_recording) {
-                s_recording = false;
-                audio_pipeline_stop();
-                voice_ble_send_press_end(audio_pipeline_session_id());
-                release_recording_pm_locks();
+                const uint32_t session_id = stop_recording();
+                voice_ble_send_button_up("primary", elapsed_button_ms(s_primary_down_us),
+                                         session_id);
             }
             esp_err_t ota_pm_err = acquire_ota_pm_locks();
             if (ota_pm_err != ESP_OK) {
@@ -431,6 +547,7 @@ static void app_event_task(void *arg)
         case APP_EVENT_OTA_END:
             s_ota_updating = false;
             release_ota_pm_locks();
+            s_app_ui_state = APP_UI_STATE_READY;
             ui_status_set_idle();
             restart_display_dim_timer();
             restart_deep_sleep_timer();
@@ -478,6 +595,11 @@ static esp_err_t init_buttons(void)
     }
     err = iot_button_register_cb(s_side_button, BUTTON_PRESS_DOWN, NULL,
                                  side_button_down_cb, NULL);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = iot_button_register_cb(s_side_button, BUTTON_PRESS_UP, NULL,
+                                 side_button_up_cb, NULL);
     if (err != ESP_OK) {
         return err;
     }
@@ -626,7 +748,9 @@ void app_main(void)
     ESP_ERROR_CHECK(init_deep_sleep_timer());
     note_activity();
     voice_ble_set_connection_callback(ble_connection_cb);
+    voice_ble_set_control_callback(ble_control_cb);
     voice_ble_set_ota_callback(ble_ota_cb);
+    ESP_ERROR_CHECK(init_buttons());
 
     esp_err_t err = voice_ble_init();
     if (err != ESP_OK) {
@@ -645,7 +769,6 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "Voice Stick booted");
 
-    ESP_ERROR_CHECK(init_buttons());
     update_battery_status();
     ESP_ERROR_CHECK(init_battery_refresh_timer());
     ESP_ERROR_CHECK(init_pmic_irq());
