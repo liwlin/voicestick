@@ -61,6 +61,7 @@ jobs:
       - name: Stage firmware checksums
         run: |
           set -euo pipefail
+          sudo chown -R "$(id -u):$(id -g)" dist
           cd dist
           shasum -a 256 "voicestick-firmware-sticks3-merged.bin" > "voicestick-firmware-sticks3-merged.bin.sha256"
 
