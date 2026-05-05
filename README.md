@@ -144,7 +144,7 @@ scripts/make-dmg.sh
 
 The build script writes `build/VoiceStick-<version>.app`, `build/VoiceStick-<version>.zip`, and a Sparkle signature file. Upload the DMG and ZIP to GitHub Releases, then update `website/appcast.xml` for the GitHub Pages update feed.
 
-GitHub Actions can do the release path automatically when a `v<version>` tag is pushed. The tag must match `VERSION`, for example `VERSION=0.1.0` pairs with `v0.1.0`. The release workflow publishes the GitHub Release assets and deploys the website/appcast to GitHub Pages.
+GitHub Actions can do the release path automatically when a `v<version>` tag is pushed. The tag must match `VERSION`, for example `VERSION=0.2.0` pairs with `v0.2.0`. The release workflow publishes the GitHub Release assets and deploys the website/appcast to GitHub Pages.
 
 The same release workflow also builds the StickS3 firmware with ESP-IDF v5.5.1 and uploads `voicestick-firmware-sticks3-merged.bin` to Aliyun OSS. This is the browser-flashing image intended for the website flasher and should be written at offset `0x0`. Configure these GitHub secrets before running the release workflow:
 
