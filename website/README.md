@@ -39,18 +39,18 @@ https://78.github.io/voicestick/appcast.xml
    scripts/make-dmg.sh
    ```
 
-4. Upload these files to GitHub Release `v0.2.0`:
+4. Upload these files to GitHub Release `v<version>`:
 
    ```text
-   build/VoiceStick-0.2.0.dmg
-   build/VoiceStick-0.2.0.zip
+   build/VoiceStick-<version>.dmg
+   build/VoiceStick-<version>.zip
    ```
 
 5. Update `website/public/appcast.xml`:
 
    - `url`: GitHub Release URL for the ZIP, not the DMG
-   - `sparkle:edSignature`: content from `build/VoiceStick-0.2.0.signature`
-   - `length`: byte size from `wc -c build/VoiceStick-0.2.0.zip`
+   - `sparkle:edSignature`: content from `build/VoiceStick-<version>.signature`
+   - `length`: byte size from `wc -c build/VoiceStick-<version>.zip`
 
 The homepage download button points at the latest GitHub Release so users can install the notarized DMG.
 

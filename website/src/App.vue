@@ -4,11 +4,15 @@ import { useI18n } from 'vue-i18n'
 import { ESPLoader, Transport } from 'esptool-js'
 import { setLocale } from './i18n'
 import productPhoto from './assets/sticks3.png'
+import packageInfo from '../package.json'
 
 const { locale, t } = useI18n()
 const releaseUrl = 'https://github.com/78/voicestick/releases/latest'
 const githubUrl = 'https://github.com/78/voicestick'
-const firmwareUrl = import.meta.env.VITE_FIRMWARE_URL || 'https://xiaozhi-voice-assistant.oss-cn-shenzhen.aliyuncs.com/voicestick/firmwares/latest/voicestick-firmware-sticks3-merged.bin'
+const defaultFirmwareUrl = `https://xiaozhi-voice-assistant.oss-cn-shenzhen.aliyuncs.com/voicestick/firmwares/latest/voicestick-firmware-sticks3-merged-${packageInfo.version}.bin`
+const firmwareManifestUrl = import.meta.env.VITE_FIRMWARE_MANIFEST_URL || 'https://xiaozhi-voice-assistant.oss-cn-shenzhen.aliyuncs.com/voicestick/firmwares/latest/manifest.json'
+const firmwareUrl = ref(import.meta.env.VITE_FIRMWARE_URL || defaultFirmwareUrl)
+const appResetSequence = 'D0|R1|W100|R0|W500|D0'
 
 const languageLabel = computed(() => (locale.value === 'zh-CN' ? t('language.en') : t('language.zh')))
 const nextLocale = computed(() => (locale.value === 'zh-CN' ? 'en-US' : 'zh-CN'))
@@ -67,7 +71,8 @@ async function fetchFirmware() {
   flashStatus.value = 'downloading'
   appendLog(t('flasher.log.downloading'))
 
-  const response = await fetch(firmwareUrl, { cache: 'no-store' })
+  await resolveFirmwareUrl()
+  const response = await fetch(firmwareUrl.value, { cache: 'no-store' })
   if (!response.ok) {
     throw new Error(t('flasher.error.downloadFailed', { status: response.status }))
   }
@@ -76,6 +81,22 @@ async function fetchFirmware() {
   firmwareSize.value = formatBytes(firmware.byteLength)
   appendLog(t('flasher.log.downloaded', { size: firmwareSize.value }))
   return firmware
+}
+
+async function resolveFirmwareUrl() {
+  if (!firmwareManifestUrl) {
+    return
+  }
+
+  const response = await fetch(firmwareManifestUrl, { cache: 'no-store' })
+  if (!response.ok) {
+    return
+  }
+
+  const manifest = await response.json()
+  if (manifest?.merged_url) {
+    firmwareUrl.value = manifest.merged_url
+  }
 }
 
 async function flashFirmware() {
@@ -130,7 +151,7 @@ async function flashFirmware() {
 
     flashProgress.value = 100
     flashStatus.value = 'resetting'
-    await loader.after('hard_reset')
+    await loader.after('custom_reset', undefined, appResetSequence)
     flashStatus.value = 'done'
     appendLog(t('flasher.log.done'))
   } catch (error) {

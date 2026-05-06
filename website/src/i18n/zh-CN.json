@@ -72,7 +72,7 @@
       "downloading": "正在下载 Release 固件...",
       "downloaded": "固件下载完成：{size}",
       "flashing": "开始写入 merged 固件到 0x0...",
-      "done": "烧录完成，设备正在重启。"
+      "done": "烧录完成，已发送设备重启信号。"
     },
     "error": {
       "downloadFailed": "固件下载失败，HTTP {status}",

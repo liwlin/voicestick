@@ -72,7 +72,7 @@
       "downloading": "Downloading Release firmware...",
       "downloaded": "Firmware downloaded: {size}",
       "flashing": "Writing merged firmware to 0x0...",
-      "done": "Flashing complete. The device is restarting."
+      "done": "Flashing complete. A reset signal was sent to the device."
     },
     "error": {
       "downloadFailed": "Firmware download failed, HTTP {status}",
