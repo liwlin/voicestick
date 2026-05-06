@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var pairDeviceWindowController: PairDeviceWindowController?
     private var onboardingWindowController: OnboardingWindowController?
+    private var firmwareUpdateWindowController: FirmwareUpdateWindowController?
     private var updaterController: SPUStandardUpdaterController?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -45,7 +46,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func startApp(config: AppConfig) {
-        let statusController = StatusController(needsPairing: config.pairedDeviceIDs.isEmpty)
+        let statusController = StatusController(pairedDeviceIDs: config.pairedDeviceIDs)
         let coordinator = VoiceStickCoordinator(config: config, statusController: statusController)
 
         self.statusController = statusController
@@ -56,18 +57,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let controller = self?.settingsWindowController ?? SettingsWindowController()
             self?.settingsWindowController = controller
             controller.onConfigChanged = { [weak self] config in
-                self?.statusController?.setNeedsPairing(config.pairedDeviceIDs.isEmpty)
+                self?.statusController?.setPairedDeviceIDs(config.pairedDeviceIDs)
                 self?.coordinator?.updateConfig(config)
-            }
-            controller.onPairedDevicesChanged = { [weak self] deviceIDs in
-                self?.statusController?.setNeedsPairing(deviceIDs.isEmpty)
-                self?.coordinator?.updatePairedDeviceIDs(deviceIDs)
-            }
-            controller.onFirmwareUpdateRequested = { [weak self] url, progress, completion in
-                self?.coordinator?.updateFirmware(from: url, progress: progress, completion: completion)
-            }
-            controller.onFirmwareUpdateCancelRequested = { [weak self] in
-                self?.coordinator?.cancelFirmwareUpdate()
             }
             self?.showDockIconWhileWindowVisible(controller)
             controller.show()
@@ -77,6 +68,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         statusController.onForgetDevice = { [weak self] deviceID in
             self?.forgetDevice(deviceID)
+        }
+        statusController.onUpdateFirmwareDevice = { [weak self] deviceID in
+            self?.updateFirmwareFromLatest(for: deviceID)
+        }
+        statusController.onCheckFirmwareUpdates = { [weak self] in
+            self?.coordinator?.checkFirmwareUpdatesNow()
         }
         statusController.onRestoreLastInput = { [weak self] in
             self?.coordinator?.restoreLastInputConfirmation() ?? false
@@ -134,7 +131,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             do {
                 try config.save()
-                self?.statusController?.setNeedsPairing(config.pairedDeviceIDs.isEmpty)
+                self?.statusController?.setPairedDeviceIDs(config.pairedDeviceIDs)
                 self?.coordinator?.updatePairedDeviceIDs(config.pairedDeviceIDs)
             } catch {
                 self?.statusController?.setStatus("Pair save failed")
@@ -143,6 +140,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         pairDeviceWindowController = controller
         showDockIconWhileWindowVisible(controller)
         controller.show()
+    }
+
+    private func updateFirmwareFromLatest(for deviceID: String) {
+        let updateWindow = FirmwareUpdateWindowController(fileName: "VS-\(deviceID)")
+        updateWindow.onCancel = { [weak self] in
+            self?.coordinator?.cancelFirmwareUpdate()
+        }
+        firmwareUpdateWindowController = updateWindow
+        showDockIconWhileWindowVisible(updateWindow)
+        updateWindow.show()
+
+        coordinator?.updateFirmwareFromLatest(for: deviceID, progress: { [weak self] progress in
+            DispatchQueue.main.async {
+                self?.firmwareUpdateWindowController?.update(progress: progress)
+            }
+        }, completion: { [weak self] result in
+            DispatchQueue.main.async {
+                self?.firmwareUpdateWindowController?.finish(result: result)
+            }
+        })
     }
 
     private func showDockIconWhileWindowVisible(_ windowController: NSWindowController) {
@@ -205,8 +222,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         config.pairedDeviceIDs.removeAll { $0 == deviceID }
         do {
             try config.save()
-            statusController?.setConnectedDevice(nil)
-            statusController?.setNeedsPairing(config.pairedDeviceIDs.isEmpty)
+            statusController?.setPairedDeviceIDs(config.pairedDeviceIDs)
+            statusController?.setConnectedDevices([])
             coordinator?.updatePairedDeviceIDs(config.pairedDeviceIDs)
         } catch {
             statusController?.setStatus("Forget device failed")

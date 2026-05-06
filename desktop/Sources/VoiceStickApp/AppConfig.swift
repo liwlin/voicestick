@@ -50,6 +50,9 @@ struct AppConfig {
     static let defaultVoiceStickCloudURL = "wss://api.xiaozhi.me/voicestick/asr/"
     static let volcengineWebSocketURL = "wss://openspeech.bytedance.com/api/v3/sauc/bigmodel_async"
     static let websiteURL = URL(string: "https://78.github.io/voicestick/")!
+    static let firmwareManifestURL = URL(
+        string: "https://xiaozhi-voice-assistant.oss-cn-shenzhen.aliyuncs.com/voicestick/firmwares/latest/manifest.json"
+    )!
 
     static var configExists: Bool {
         FileManager.default.fileExists(atPath: configURL.path)

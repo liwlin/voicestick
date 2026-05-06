@@ -21,10 +21,13 @@ final class VoiceStickCoordinator {
     private var asr: VolcengineASRClient
     private let oggMuxer = OggOpusMuxer(sampleRate: 16_000, channels: 1)
     private let inputInjector = InputInjector()
+    private let firmwareManifestClient = FirmwareManifestClient()
     private var debugAudioRecorder: DebugAudioRecorder
     private let minimumRecordingDuration: TimeInterval = 0.5
+    private let firmwareManifestCacheDuration: TimeInterval = 24 * 60 * 60
 
     private var activeSessionID: UInt32?
+    private var activePeripheralID: UUID?
     private var activeSessionStartedAt: Date?
     private var receivedAudioFrames = 0
     private var bufferedOggChunks: [Data] = []
@@ -33,7 +36,12 @@ final class VoiceStickCoordinator {
     private var pastedFinalText = false
     private var pendingPasteState = PendingPasteState.idle
     private var lastRecoverableText: String?
+    private var lastRecoverablePeripheralID: UUID?
     private var pairedDeviceIDs: [String]
+    private var firmwareInfoByDeviceID: [String: DeviceFirmwareInfo] = [:]
+    private var latestFirmwareManifest: FirmwareManifest?
+    private var lastFirmwareManifestCheckAt: Date?
+    private var firmwareManifestCheckInFlight = false
     private var errorRecoveryToken = 0
     private var isShowingASRError = false
 
@@ -50,26 +58,29 @@ final class VoiceStickCoordinator {
     }
 
     func start() {
-        ble.onConnectionChange = { [weak self] connectedDevice in
+        ble.onConnectionChange = { [weak self] connectedDevices in
             guard let self else { return }
-            self.statusController.setConnectedDevice(connectedDevice)
-            if connectedDevice != nil {
+            self.statusController.setConnectedDevices(connectedDevices)
+            self.cancelActiveCycleIfDeviceDisconnected()
+            self.checkFirmwareUpdatesIfNeeded(force: false, showErrors: false)
+            if !connectedDevices.isEmpty {
                 self.statusController.setStatus("Connected")
             } else {
                 self.statusController.setStatus(self.pairedDeviceIDs.isEmpty ? "Pair a VoiceStick" : "Scanning")
             }
         }
 
-        ble.onStateEvent = { [weak self] event in
-            self?.handleStateEvent(event)
+        ble.onStateEvent = { [weak self] peripheralID, event in
+            self?.handleStateEvent(event, peripheralID: peripheralID)
         }
 
-        ble.onAudioFrame = { [weak self] frame in
-            self?.handleAudioFrame(frame)
+        ble.onAudioFrame = { [weak self] peripheralID, frame in
+            self?.handleAudioFrame(frame, peripheralID: peripheralID)
         }
 
         configureASRCallbacks()
         ble.start()
+        checkFirmwareUpdatesIfNeeded(force: false, showErrors: false)
     }
 
     func updateConfig(_ config: AppConfig) {
@@ -81,11 +92,13 @@ final class VoiceStickCoordinator {
             asr.onUpgradeURL = nil
             asr.cancel()
             activeSessionID = nil
+            activePeripheralID = nil
             activeSessionStartedAt = nil
             pendingPasteState = .idle
             debugAudioRecorder.discard()
             statusController.hideOverlay()
-            ble.sendUIState("ready")
+            sendUIStateForActiveDevice("ready")
+            activePeripheralID = nil
             finishRecognitionCycle()
         }
 
@@ -109,7 +122,7 @@ final class VoiceStickCoordinator {
     private func configureASRCallbacks() {
         asr.onPartial = { [weak self] text in
             self?.statusController.showPartial(text)
-            self?.ble.sendUIState("thinking", text: text)
+            self?.sendUIStateForActiveDevice("thinking", text: text)
         }
 
         asr.onFinal = { [weak self] text in
@@ -136,16 +149,18 @@ final class VoiceStickCoordinator {
 
     func updatePairedDeviceIDs(_ deviceIDs: [String]) {
         pairedDeviceIDs = deviceIDs
-        statusController.setConnectedDevice(nil)
+        statusController.setPairedDeviceIDs(deviceIDs)
+        statusController.setConnectedDevices([])
         statusController.setStatus(deviceIDs.isEmpty ? "Pair a VoiceStick" : "Scanning")
         ble.updatePairedDeviceIDs(deviceIDs)
     }
 
-    func updateFirmware(from url: URL, progress: @escaping (FirmwareUpdateProgress) -> Void,
+    func updateFirmware(from url: URL, for deviceID: String,
+                        progress: @escaping (FirmwareUpdateProgress) -> Void,
                         completion: @escaping (Result<Void, Error>) -> Void) {
         do {
             let image = try Data(contentsOf: url)
-            ble.updateFirmware(image: image, progress: progress) { result in
+            ble.updateFirmware(image: image, for: deviceID, progress: progress) { result in
                 DispatchQueue.main.async {
                     completion(result)
                 }
@@ -159,25 +174,55 @@ final class VoiceStickCoordinator {
         ble.cancelFirmwareUpdate()
     }
 
-    private func handleStateEvent(_ event: StateEvent) {
+    func checkFirmwareUpdatesNow() {
+        checkFirmwareUpdatesIfNeeded(force: true, showErrors: true)
+    }
+
+    func updateFirmwareFromLatest(for deviceID: String,
+                                  progress: @escaping (FirmwareUpdateProgress) -> Void,
+                                  completion: @escaping (Result<Void, Error>) -> Void) {
+        guard let manifest = latestFirmwareManifest else {
+            completion(.failure(FirmwareManifestClient.FirmwareManifestError.invalidResponse))
+            return
+        }
+
+        firmwareManifestClient.downloadOTA(from: manifest) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                switch result {
+                case .success(let image):
+                    self.ble.updateFirmware(image: image, for: deviceID, progress: progress) { result in
+                        DispatchQueue.main.async {
+                            completion(result)
+                        }
+                    }
+                case .failure(let error):
+                    completion(.failure(error))
+                }
+            }
+        }
+    }
+
+    private func handleStateEvent(_ event: StateEvent, peripheralID: UUID) {
         switch event.event {
         case "device_info":
             if let hardware = event.hardware, let firmwareVersion = event.firmwareVersion {
                 NSLog("Connected VoiceStick hardware=\(hardware) firmware=\(firmwareVersion)")
             }
+            updateDeviceFirmwareInfo(event: event, peripheralID: peripheralID)
         case "button_down":
-            handleButtonDown(event)
+            handleButtonDown(event, peripheralID: peripheralID)
         case "button_up":
-            handleButtonUp(event)
+            handleButtonUp(event, peripheralID: peripheralID)
         default:
             break
         }
     }
 
-    private func handleButtonDown(_ event: StateEvent) {
+    private func handleButtonDown(_ event: StateEvent, peripheralID: UUID) {
         switch event.button {
         case "primary":
-            handlePrimaryButtonDown(sessionID: event.sessionID)
+            handlePrimaryButtonDown(sessionID: event.sessionID, peripheralID: peripheralID)
         case "secondary":
             break
         default:
@@ -185,22 +230,30 @@ final class VoiceStickCoordinator {
         }
     }
 
-    private func handleButtonUp(_ event: StateEvent) {
+    private func handleButtonUp(_ event: StateEvent, peripheralID: UUID) {
         switch event.button {
         case "primary":
-            handlePrimaryButtonUp()
+            handlePrimaryButtonUp(peripheralID: peripheralID)
         case "secondary":
-            cancelPendingPaste()
+            cancelPendingPaste(peripheralID: peripheralID)
         default:
             break
         }
     }
 
-    private func handlePrimaryButtonDown(sessionID: UInt32?) {
-        if handleFrontButtonDuringPendingPaste() {
+    private func handlePrimaryButtonDown(sessionID: UInt32?, peripheralID: UUID) {
+        if handleFrontButtonDuringPendingPaste(peripheralID: peripheralID) {
+            return
+        }
+        if let activePeripheralID {
+            if activePeripheralID != peripheralID {
+                ble.sendUIState("ready", to: peripheralID)
+            }
+            NSLog("Ignoring primary button while another recording is active")
             return
         }
         if isWaitingForFinalText {
+            ble.sendUIState("ready", to: peripheralID)
             NSLog("Ignoring primary button while previous recording is finalizing")
             return
         }
@@ -209,6 +262,7 @@ final class VoiceStickCoordinator {
         }
 
         activeSessionID = sessionID
+        activePeripheralID = peripheralID
         activeSessionStartedAt = Date()
         receivedAudioFrames = 0
         bufferedOggChunks.removeAll(keepingCapacity: true)
@@ -218,13 +272,13 @@ final class VoiceStickCoordinator {
         pendingPasteState = .idle
         isShowingASRError = false
         oggMuxer.reset()
-        debugAudioRecorder.start(sessionID: sessionID)
+        debugAudioRecorder.start(deviceID: deviceID(for: peripheralID), sessionID: sessionID)
         statusController.showListening()
-        ble.sendUIState("recording")
+        sendUIStateForActiveDevice("recording")
     }
 
-    private func handlePrimaryButtonUp() {
-        guard activeSessionID != nil else {
+    private func handlePrimaryButtonUp(peripheralID: UUID) {
+        guard activeSessionID != nil, activePeripheralID == peripheralID else {
             return
         }
         let recordingDuration = currentRecordingDuration
@@ -236,13 +290,13 @@ final class VoiceStickCoordinator {
         } else if receivedAudioFrames == 0 {
             finishWithASRError("No audio frames from device")
         } else {
-            ble.sendUIState("thinking")
+            sendUIStateForActiveDevice("thinking")
             sendFinalOggChunkIfNeeded(recordingDuration: recordingDuration)
         }
     }
 
-    private func handleAudioFrame(_ frame: AudioFrame) {
-        guard frame.sessionID == activeSessionID else { return }
+    private func handleAudioFrame(_ frame: AudioFrame, peripheralID: UUID) {
+        guard frame.sessionID == activeSessionID, activePeripheralID == peripheralID else { return }
 
         if frame.isEnd && frame.payload.isEmpty {
             sendFinalOggChunkIfNeeded(recordingDuration: currentRecordingDuration)
@@ -268,12 +322,12 @@ final class VoiceStickCoordinator {
             } else if asrStarted {
                 debugAudioRecorder.finish()
                 statusController.setStatus("Finalizing")
-                ble.sendUIState("thinking")
+                sendUIStateForActiveDevice("thinking")
             } else {
                 debugAudioRecorder.finish()
                 startASRAndFlushBufferedChunks(lastChunkIsFinal: true)
                 statusController.setStatus("Finalizing")
-                ble.sendUIState("thinking")
+                sendUIStateForActiveDevice("thinking")
             }
         }
     }
@@ -295,7 +349,7 @@ final class VoiceStickCoordinator {
         activeSessionStartedAt = nil
         sendOrBufferOggChunk(finalChunk, isLast: true, canStartASR: true)
         statusController.setStatus("Finalizing")
-        ble.sendUIState("thinking")
+        sendUIStateForActiveDevice("thinking")
     }
 
     private var currentRecordingDuration: TimeInterval {
@@ -341,7 +395,8 @@ final class VoiceStickCoordinator {
         debugAudioRecorder.discard()
         statusController.setStatus("Connected")
         statusController.hideOverlay()
-        ble.sendUIState("ready")
+        sendUIStateForActiveDevice("ready")
+        activePeripheralID = nil
     }
 
     private func finishWithFinalText(_ text: String) {
@@ -351,19 +406,21 @@ final class VoiceStickCoordinator {
             pendingPasteState = .idle
             statusController.showFinal(text) { [weak self] in
                 self?.finishRecognitionCycle()
-                self?.ble.sendUIState("ready")
+                self?.sendUIStateForActiveDevice("ready")
+                self?.activePeripheralID = nil
             }
             return
         }
 
         pastedFinalText = true
         lastRecoverableText = text
+        lastRecoverablePeripheralID = activePeripheralID
         statusController.setHasRecoverableInput(true)
         pendingPasteState = .waitingToPaste(text: text)
         statusController.showFinal(text) { [weak self] in
             self?.commitPendingPaste(text: text)
         }
-        ble.sendUIState("pending_confirmation", text: text)
+        sendUIStateForActiveDevice("pending_confirmation", text: text)
     }
 
     private func finishWithASRError(_ message: String) {
@@ -377,7 +434,7 @@ final class VoiceStickCoordinator {
         isShowingASRError = true
         errorRecoveryToken += 1
         let token = errorRecoveryToken
-        ble.sendUIState("error", text: message)
+        sendUIStateForActiveDevice("error", text: message)
         statusController.showError(message) { [weak self] in
             guard let self, self.errorRecoveryToken == token else { return }
             self.recoverFromASRError(hideOverlay: false)
@@ -395,7 +452,8 @@ final class VoiceStickCoordinator {
             statusController.setStatus("Pair a VoiceStick")
         } else {
             statusController.setStatus("Ready")
-            ble.sendUIState("ready")
+            sendUIStateForActiveDevice("ready")
+            activePeripheralID = nil
         }
     }
 
@@ -412,7 +470,8 @@ final class VoiceStickCoordinator {
         finishRecognitionCycle()
         inputInjector.paste(text: text, pressEnter: config.autoEnter)
         statusController.setStatus("Ready")
-        ble.sendUIState("ready")
+        sendUIStateForActiveDevice("ready")
+        activePeripheralID = nil
     }
 
     private var isWaitingForFinalText: Bool {
@@ -433,6 +492,10 @@ final class VoiceStickCoordinator {
     }
 
     func restoreLastInputConfirmation() -> Bool {
+        restoreLastInputConfirmation(peripheralID: lastRecoverablePeripheralID)
+    }
+
+    private func restoreLastInputConfirmation(peripheralID: UUID?) -> Bool {
         guard
             pendingPasteState.isIdle,
             activeSessionID == nil,
@@ -443,22 +506,25 @@ final class VoiceStickCoordinator {
             return false
         }
 
+        activePeripheralID = peripheralID
         pendingPasteState = .paused(text: text)
         statusController.showPausedFinal(text)
-        ble.sendUIState("pending_confirmation", text: text)
+        sendUIStateForActiveDevice("pending_confirmation", text: text)
         return true
     }
 
-    private func handleFrontButtonDuringPendingPaste() -> Bool {
+    private func handleFrontButtonDuringPendingPaste(peripheralID: UUID) -> Bool {
         switch pendingPasteState {
         case .idle:
             return false
         case .waitingToPaste(let text):
+            guard activePeripheralID == peripheralID else { return true }
             pendingPasteState = .paused(text: text)
             statusController.showPausedFinal(text)
-            ble.sendUIState("pending_confirmation", text: text)
+            sendUIStateForActiveDevice("pending_confirmation", text: text)
             return true
         case .paused(let text):
+            guard activePeripheralID == peripheralID else { return true }
             statusController.hideOverlay { [weak self] in
                 self?.commitPendingPaste(text: text)
             }
@@ -466,23 +532,26 @@ final class VoiceStickCoordinator {
         }
     }
 
-    private func cancelPendingPaste() {
+    private func cancelPendingPaste(peripheralID: UUID) {
         if activeSessionID != nil {
             return
         }
         if isWaitingForFinalText {
+            guard activePeripheralID == peripheralID else { return }
             cancelRecognitionInProgress()
             return
         }
         if pendingPasteText == nil {
-            _ = restoreLastInputConfirmation()
+            _ = restoreLastInputConfirmation(peripheralID: peripheralID)
             return
         }
+        guard activePeripheralID == peripheralID else { return }
         pendingPasteState = .idle
         finishRecognitionCycle()
         statusController.hideOverlay()
         statusController.setStatus("Ready")
-        ble.sendUIState("ready")
+        sendUIStateForActiveDevice("ready")
+        activePeripheralID = nil
     }
 
     private func cancelRecognitionInProgress() {
@@ -491,7 +560,20 @@ final class VoiceStickCoordinator {
         finishRecognitionCycle()
         statusController.hideOverlay()
         statusController.setStatus("Ready")
-        ble.sendUIState("ready")
+        sendUIStateForActiveDevice("ready")
+        activePeripheralID = nil
+    }
+
+    private func cancelActiveCycleIfDeviceDisconnected() {
+        guard let activePeripheralID, !ble.isConnected(activePeripheralID) else { return }
+        asr.cancel()
+        pendingPasteState = .idle
+        activeSessionID = nil
+        self.activePeripheralID = nil
+        activeSessionStartedAt = nil
+        debugAudioRecorder.discard()
+        finishRecognitionCycle()
+        statusController.hideOverlay()
     }
 
     private func finishRecognitionCycle() {
@@ -499,5 +581,110 @@ final class VoiceStickCoordinator {
         sentFinalAudioChunk = false
         pastedFinalText = false
         bufferedOggChunks.removeAll(keepingCapacity: true)
+    }
+
+    private func updateDeviceFirmwareInfo(event: StateEvent, peripheralID: UUID) {
+        guard let deviceID = ble.deviceID(for: peripheralID) else { return }
+        var info = firmwareInfoByDeviceID[deviceID] ?? DeviceFirmwareInfo()
+        if let hardware = event.hardware {
+            info.hardware = hardware
+        }
+        if let firmwareVersion = event.firmwareVersion {
+            info.currentVersion = firmwareVersion
+        }
+        info.errorMessage = nil
+        firmwareInfoByDeviceID[deviceID] = info
+        refreshFirmwareAvailability()
+        checkFirmwareUpdatesIfNeeded(force: false, showErrors: false)
+    }
+
+    private func checkFirmwareUpdatesIfNeeded(force: Bool, showErrors: Bool) {
+        if firmwareManifestCheckInFlight {
+            return
+        }
+        if !force,
+           let lastFirmwareManifestCheckAt,
+           Date().timeIntervalSince(lastFirmwareManifestCheckAt) < firmwareManifestCacheDuration {
+            refreshFirmwareAvailability()
+            return
+        }
+
+        firmwareManifestCheckInFlight = true
+        setFirmwareChecking(true)
+        firmwareManifestClient.fetchManifest { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                self.firmwareManifestCheckInFlight = false
+                self.setFirmwareChecking(false)
+                switch result {
+                case .success(let manifest):
+                    self.lastFirmwareManifestCheckAt = Date()
+                    self.latestFirmwareManifest = manifest
+                    self.clearFirmwareErrors()
+                    self.refreshFirmwareAvailability()
+                case .failure(let error):
+                    if showErrors {
+                        self.setFirmwareError(error.localizedDescription)
+                    } else {
+                        self.refreshFirmwareAvailability()
+                    }
+                }
+            }
+        }
+    }
+
+    private func refreshFirmwareAvailability() {
+        for (deviceID, var info) in firmwareInfoByDeviceID {
+            info.latestVersion = nil
+            info.updateAvailable = false
+            guard let manifest = latestFirmwareManifest,
+                  let hardware = info.hardware,
+                  hardware == manifest.hardware else {
+                firmwareInfoByDeviceID[deviceID] = info
+                continue
+            }
+            info.latestVersion = manifest.version
+            if let currentVersion = info.currentVersion {
+                info.updateAvailable = FirmwareVersion.isVersion(currentVersion, olderThan: manifest.version)
+            }
+            firmwareInfoByDeviceID[deviceID] = info
+        }
+        statusController.setFirmwareInfo(firmwareInfoByDeviceID)
+    }
+
+    private func setFirmwareChecking(_ isChecking: Bool) {
+        for deviceID in pairedDeviceIDs {
+            var info = firmwareInfoByDeviceID[deviceID] ?? DeviceFirmwareInfo()
+            info.isChecking = isChecking
+            if isChecking {
+                info.errorMessage = nil
+            }
+            firmwareInfoByDeviceID[deviceID] = info
+        }
+        statusController.setFirmwareInfo(firmwareInfoByDeviceID)
+    }
+
+    private func clearFirmwareErrors() {
+        for (deviceID, var info) in firmwareInfoByDeviceID {
+            info.errorMessage = nil
+            firmwareInfoByDeviceID[deviceID] = info
+        }
+    }
+
+    private func setFirmwareError(_ message: String) {
+        for deviceID in pairedDeviceIDs {
+            var info = firmwareInfoByDeviceID[deviceID] ?? DeviceFirmwareInfo()
+            info.errorMessage = message
+            firmwareInfoByDeviceID[deviceID] = info
+        }
+        statusController.setFirmwareInfo(firmwareInfoByDeviceID)
+    }
+
+    private func sendUIStateForActiveDevice(_ state: String, text: String = "") {
+        ble.sendUIState(state, text: text, to: activePeripheralID)
+    }
+
+    private func deviceID(for peripheralID: UUID) -> String? {
+        ble.deviceID(for: peripheralID)
     }
 }

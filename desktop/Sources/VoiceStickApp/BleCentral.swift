@@ -1,3 +1,4 @@
+import AppKit
 import CoreBluetooth
 import Foundation
 
@@ -69,17 +70,33 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     private var otaCharacteristics: [UUID: CBCharacteristic] = [:]
     private var firmwareUpdateSession: FirmwareUpdateSession?
 
-    var onConnectionChange: ((ConnectedVoiceStickDevice?) -> Void)?
-    var onAudioFrame: ((AudioFrame) -> Void)?
-    var onStateEvent: ((StateEvent) -> Void)?
+    var onConnectionChange: (([ConnectedVoiceStickDevice]) -> Void)?
+    var onAudioFrame: ((UUID, AudioFrame) -> Void)?
+    var onStateEvent: ((UUID, StateEvent) -> Void)?
 
     init(pairedDeviceIDs: [String]) {
         self.pairedDeviceIDs = Set(pairedDeviceIDs)
         super.init()
     }
 
+    deinit {
+        NSWorkspace.shared.notificationCenter.removeObserver(self)
+    }
+
     func start() {
         central = CBCentralManager(delegate: self, queue: .main)
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceWillSleep),
+            name: NSWorkspace.willSleepNotification,
+            object: nil
+        )
+        NSWorkspace.shared.notificationCenter.addObserver(
+            self,
+            selector: #selector(workspaceDidWake),
+            name: NSWorkspace.didWakeNotification,
+            object: nil
+        )
     }
 
     func updatePairedDeviceIDs(_ deviceIDs: [String]) {
@@ -93,24 +110,32 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         controlCharacteristics.removeAll()
         otaCharacteristics.removeAll()
         failFirmwareUpdate(FirmwareUpdateError.noConnectedDevice)
-        onConnectionChange?(nil)
+        onConnectionChange?([])
         scanIfReady()
     }
 
-    func sendUIState(_ state: String, text: String = "") {
+    func sendUIState(_ state: String, text: String = "", to peripheralID: UUID? = nil) {
         let data = BleProtocol.uiStatePayload(state: state, text: text)
+        if let peripheralID {
+            if let characteristic = controlCharacteristics[peripheralID] {
+                peripherals[peripheralID]?.writeValue(data, for: characteristic, type: .withoutResponse)
+            }
+            return
+        }
+
         for (id, characteristic) in controlCharacteristics {
             peripherals[id]?.writeValue(data, for: characteristic, type: .withoutResponse)
         }
     }
 
-    func updateFirmware(image: Data, progress: @escaping (FirmwareUpdateProgress) -> Void,
+    func updateFirmware(image: Data, for deviceID: String,
+                        progress: @escaping (FirmwareUpdateProgress) -> Void,
                         completion: @escaping (Result<Void, Error>) -> Void) {
         guard firmwareUpdateSession == nil else {
             completion(.failure(FirmwareUpdateError.transferAlreadyActive))
             return
         }
-        guard let peripheralID = currentConnectedPeripheralID,
+        guard let peripheralID = connectedDevices.first(where: { $0.value.deviceID == deviceID })?.key,
               let peripheral = peripherals[peripheralID] else {
             completion(.failure(FirmwareUpdateError.noConnectedDevice))
             return
@@ -146,16 +171,36 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         failFirmwareUpdate(FirmwareUpdateError.firmwareUpdateCancelled)
     }
 
+    func deviceID(for peripheralID: UUID) -> String? {
+        connectedDevices[peripheralID]?.deviceID ?? discoveredDevices[peripheralID]?.deviceID
+    }
+
+    func isConnected(_ peripheralID: UUID) -> Bool {
+        connectedDevices[peripheralID] != nil
+    }
+
     func centralManagerDidUpdateState(_ central: CBCentralManager) {
-        guard central.state == .poweredOn else { return }
-        scanIfReady()
+        switch central.state {
+        case .poweredOn:
+            scanIfReady()
+        case .unknown, .resetting, .unsupported, .unauthorized, .poweredOff:
+            clearConnectionState()
+        @unknown default:
+            clearConnectionState()
+        }
     }
 
     func centralManager(_ central: CBCentralManager, didDiscover peripheral: CBPeripheral,
                         advertisementData: [String: Any], rssi RSSI: NSNumber) {
         let localName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         guard shouldConnect(localName: localName, peripheralName: peripheral.name) else { return }
-        guard peripherals[peripheral.identifier] == nil else { return }
+        if let existingPeripheral = peripherals[peripheral.identifier] {
+            if existingPeripheral.state == .disconnected {
+                removePeripheral(existingPeripheral)
+            } else {
+                return
+            }
+        }
         if let device = connectedDevice(localName: localName, peripheralName: peripheral.name) {
             discoveredDevices[peripheral.identifier] = device
         }
@@ -167,20 +212,19 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
         connectedDevices[peripheral.identifier] = discoveredDevices[peripheral.identifier]
             ?? connectedDevice(localName: nil, peripheralName: peripheral.name)
-        onConnectionChange?(currentConnectedDevice)
+        onConnectionChange?(currentConnectedDevices)
         peripheral.discoverServices([CBUUID(string: BleProtocol.serviceUUID)])
     }
 
+    func centralManager(_ central: CBCentralManager, didFailToConnect peripheral: CBPeripheral, error: Error?) {
+        removePeripheral(peripheral)
+        onConnectionChange?(currentConnectedDevices)
+        scanIfReady()
+    }
+
     func centralManager(_ central: CBCentralManager, didDisconnectPeripheral peripheral: CBPeripheral, error: Error?) {
-        peripherals.removeValue(forKey: peripheral.identifier)
-        discoveredDevices.removeValue(forKey: peripheral.identifier)
-        connectedDevices.removeValue(forKey: peripheral.identifier)
-        controlCharacteristics.removeValue(forKey: peripheral.identifier)
-        otaCharacteristics.removeValue(forKey: peripheral.identifier)
-        if firmwareUpdateSession?.peripheralID == peripheral.identifier {
-            failFirmwareUpdate(FirmwareUpdateError.noConnectedDevice)
-        }
-        onConnectionChange?(currentConnectedDevice)
+        removePeripheral(peripheral)
+        onConnectionChange?(currentConnectedDevices)
         scanIfReady()
     }
 
@@ -199,7 +243,7 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
                 peripheral.setNotifyValue(true, for: characteristic)
             case BleProtocol.controlUUID:
                 controlCharacteristics[peripheral.identifier] = characteristic
-                sendUIState("ready")
+                sendUIState("ready", to: peripheral.identifier)
             case BleProtocol.otaRXUUID:
                 otaCharacteristics[peripheral.identifier] = characteristic
             case BleProtocol.otaStateUUID:
@@ -215,11 +259,11 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         switch characteristic.uuid.uuidString.uppercased() {
         case BleProtocol.audioUUID:
             if let frame = BleProtocol.parseAudioFrame(data) {
-                onAudioFrame?(frame)
+                onAudioFrame?(peripheral.identifier, frame)
             }
         case BleProtocol.stateUUID:
             if let event = BleProtocol.parseStateEvent(data) {
-                onStateEvent?(event)
+                onStateEvent?(peripheral.identifier, event)
             }
         case BleProtocol.otaStateUUID:
             if let event = BleProtocol.parseFirmwareOTAStateEvent(data) {
@@ -268,14 +312,8 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         )
     }
 
-    private var currentConnectedDevice: ConnectedVoiceStickDevice? {
-        connectedDevices.values.sorted { $0.name < $1.name }.first
-    }
-
-    private var currentConnectedPeripheralID: UUID? {
-        connectedDevices.keys.sorted { lhs, rhs in
-            (connectedDevices[lhs]?.name ?? "") < (connectedDevices[rhs]?.name ?? "")
-        }.first
+    private var currentConnectedDevices: [ConnectedVoiceStickDevice] {
+        connectedDevices.values.sorted { $0.name < $1.name }
     }
 
     private func sendNextFirmwareUpdateFrame() {
@@ -380,6 +418,38 @@ final class BleCentral: NSObject, CBCentralManagerDelegate, CBPeripheralDelegate
         } else {
             central.scanForPeripherals(withServices: [CBUUID(string: BleProtocol.serviceUUID)])
         }
+    }
+
+    private func clearConnectionState() {
+        central?.stopScan()
+        if firmwareUpdateSession != nil {
+            failFirmwareUpdate(FirmwareUpdateError.noConnectedDevice)
+        }
+        peripherals.removeAll()
+        discoveredDevices.removeAll()
+        connectedDevices.removeAll()
+        controlCharacteristics.removeAll()
+        otaCharacteristics.removeAll()
+        onConnectionChange?([])
+    }
+
+    private func removePeripheral(_ peripheral: CBPeripheral) {
+        peripherals.removeValue(forKey: peripheral.identifier)
+        discoveredDevices.removeValue(forKey: peripheral.identifier)
+        connectedDevices.removeValue(forKey: peripheral.identifier)
+        controlCharacteristics.removeValue(forKey: peripheral.identifier)
+        otaCharacteristics.removeValue(forKey: peripheral.identifier)
+        if firmwareUpdateSession?.peripheralID == peripheral.identifier {
+            failFirmwareUpdate(FirmwareUpdateError.noConnectedDevice)
+        }
+    }
+
+    @objc private func workspaceWillSleep() {
+        clearConnectionState()
+    }
+
+    @objc private func workspaceDidWake() {
+        scanIfReady()
     }
 
     static func deviceID(from name: String) -> String? {

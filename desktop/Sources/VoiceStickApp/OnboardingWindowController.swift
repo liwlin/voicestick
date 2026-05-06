@@ -349,7 +349,6 @@ final class OnboardingWindowController: NSWindowController, NSWindowDelegate, CB
         } else {
             devices.append(device)
         }
-        devices.sort { $0.rssi > $1.rssi }
         tableView.reloadData()
         restoreSelection(selectedIdentifier)
         scanStatusLabel.stringValue = devices.isEmpty ? "Scanning" : "\(devices.count) found"

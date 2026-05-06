@@ -3,6 +3,7 @@ import Foundation
 final class DebugAudioRecorder {
     private let enabled: Bool
     private let directory: URL
+    private var currentDeviceID: String?
     private var currentSessionID: UInt32?
     private var currentStartedAt: Date?
     private var currentAudio = Data()
@@ -12,8 +13,9 @@ final class DebugAudioRecorder {
         self.directory = directory
     }
 
-    func start(sessionID: UInt32?) {
+    func start(deviceID: String?, sessionID: UInt32?) {
         guard enabled else { return }
+        currentDeviceID = deviceID
         currentSessionID = sessionID
         currentStartedAt = Date()
         currentAudio.removeAll(keepingCapacity: true)
@@ -47,6 +49,7 @@ final class DebugAudioRecorder {
     }
 
     private func reset() {
+        currentDeviceID = nil
         currentSessionID = nil
         currentStartedAt = nil
         currentAudio.removeAll(keepingCapacity: false)
@@ -58,9 +61,8 @@ final class DebugAudioRecorder {
         formatter.dateFormat = "yyyyMMdd-HHmmss"
         let timestamp = formatter.string(from: currentStartedAt ?? Date())
 
-        if let currentSessionID {
-            return "\(timestamp)-session-\(currentSessionID).ogg"
-        }
-        return "\(timestamp)-session-unknown.ogg"
+        let device = currentDeviceID.map { "VS-\($0)" } ?? "unknown-device"
+        let session = currentSessionID.map(String.init) ?? "unknown"
+        return "\(timestamp)-\(device)-session-\(session).ogg"
     }
 }

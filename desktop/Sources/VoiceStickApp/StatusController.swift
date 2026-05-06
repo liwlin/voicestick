@@ -107,30 +107,41 @@ final class StatusController {
     var onOpenSettings: (() -> Void)?
     var onPairDevice: (() -> Void)?
     var onForgetDevice: ((String) -> Void)?
+    var onUpdateFirmwareDevice: ((String) -> Void)?
+    var onCheckFirmwareUpdates: (() -> Void)?
     var onRestoreLastInput: (() -> Bool)?
     var onCheckForUpdates: (() -> Void)? {
         didSet { rebuildMenu() }
     }
     private var needsPairing: Bool
     private var hasRecoverableInput = false
-    private var connectedDevice: ConnectedVoiceStickDevice?
+    private var pairedDeviceIDs: [String]
+    private var connectedDevices: [ConnectedVoiceStickDevice] = []
+    private var firmwareInfoByDeviceID: [String: DeviceFirmwareInfo] = [:]
 
-    init(needsPairing: Bool = false) {
-        self.needsPairing = needsPairing
+    init(pairedDeviceIDs: [String] = []) {
+        self.pairedDeviceIDs = pairedDeviceIDs
+        self.needsPairing = pairedDeviceIDs.isEmpty
         updateStatusButton(.ready)
         rebuildMenu()
     }
 
-    func setNeedsPairing(_ needsPairing: Bool) {
-        guard self.needsPairing != needsPairing else { return }
-        self.needsPairing = needsPairing
+    func setPairedDeviceIDs(_ deviceIDs: [String]) {
+        pairedDeviceIDs = deviceIDs
+        needsPairing = deviceIDs.isEmpty
         rebuildMenu()
     }
 
-    func setConnectedDevice(_ device: ConnectedVoiceStickDevice?) {
-        guard connectedDevice?.deviceID != device?.deviceID ||
-                connectedDevice?.name != device?.name else { return }
-        connectedDevice = device
+    func setConnectedDevices(_ devices: [ConnectedVoiceStickDevice]) {
+        let sortedDevices = devices.sorted { $0.deviceID < $1.deviceID }
+        guard connectedDevices.map(\.deviceID) != sortedDevices.map(\.deviceID) ||
+                connectedDevices.map(\.name) != sortedDevices.map(\.name) else { return }
+        connectedDevices = sortedDevices
+        rebuildMenu()
+    }
+
+    func setFirmwareInfo(_ infoByDeviceID: [String: DeviceFirmwareInfo]) {
+        firmwareInfoByDeviceID = infoByDeviceID
         rebuildMenu()
     }
 
@@ -151,50 +162,20 @@ final class StatusController {
             menu.addItem(NSMenuItem.separator())
         }
 
-        if let connectedDevice {
-            let deviceItem = makeMenuItem(
-                title: connectedDevice.name,
-                symbolName: "link.circle.fill",
-                action: nil
-            )
-            let submenu = NSMenu()
-            let forgetItem = makeMenuItem(
-                title: "Forget This Device",
-                symbolName: "xmark.circle",
-                action: #selector(forgetConnectedDevice)
-            )
-            forgetItem.representedObject = connectedDevice.deviceID
-            submenu.addItem(forgetItem)
-            deviceItem.submenu = submenu
-            menu.addItem(deviceItem)
+        addDeviceItems()
 
-            menu.addItem(makeMenuItem(
-                title: "Settings...",
-                symbolName: "gearshape",
-                action: #selector(openSettings),
-                keyEquivalent: ","
-            ))
-        } else if needsPairing {
-            menu.addItem(makeMenuItem(
-                title: "Pair Device...",
-                symbolName: "dot.radiowaves.left.and.right",
-                action: #selector(pairDevice)
-            ))
+        menu.addItem(makeMenuItem(
+            title: "Pair Device...",
+            symbolName: "dot.radiowaves.left.and.right",
+            action: #selector(pairDevice)
+        ))
 
-            menu.addItem(makeMenuItem(
-                title: "Settings...",
-                symbolName: "gearshape",
-                action: #selector(openSettings),
-                keyEquivalent: ","
-            ))
-        } else {
-            menu.addItem(makeMenuItem(
-                title: "Settings...",
-                symbolName: "gearshape",
-                action: #selector(openSettings),
-                keyEquivalent: ","
-            ))
-        }
+        menu.addItem(makeMenuItem(
+            title: "Settings...",
+            symbolName: "gearshape",
+            action: #selector(openSettings),
+            keyEquivalent: ","
+        ))
 
         menu.addItem(NSMenuItem.separator())
 
@@ -204,9 +185,15 @@ final class StatusController {
             action: #selector(openWebsite)
         ))
 
+        menu.addItem(makeMenuItem(
+            title: "Check for Firmware Updates",
+            symbolName: "arrow.down.circle",
+            action: #selector(checkFirmwareUpdates)
+        ))
+
         if onCheckForUpdates != nil {
             menu.addItem(makeMenuItem(
-                title: "Check for Updates...",
+                title: "Check for App Updates...",
                 symbolName: "arrow.triangle.2.circlepath",
                 action: #selector(checkForUpdates)
             ))
@@ -220,6 +207,90 @@ final class StatusController {
         ))
 
         statusItem.menu = menu
+    }
+
+    private func addDeviceItems() {
+        guard !pairedDeviceIDs.isEmpty else { return }
+
+        let connectedByID = Dictionary(uniqueKeysWithValues: connectedDevices.map { ($0.deviceID, $0) })
+        for deviceID in pairedDeviceIDs.sorted() {
+            let connectedDevice = connectedByID[deviceID]
+            let title = connectedDevice?.name ?? "VS-\(deviceID)"
+            let deviceItem = makeMenuItem(
+                title: title,
+                symbolName: connectedDevice == nil ? "link.circle" : "link.circle.fill",
+                action: nil
+            )
+            let submenu = NSMenu()
+            let stateItem = NSMenuItem(
+                title: connectedDevice == nil ? "Scanning" : "Connected",
+                action: nil,
+                keyEquivalent: ""
+            )
+            stateItem.isEnabled = false
+            stateItem.image = Self.symbolImage(
+                named: connectedDevice == nil ? "antenna.radiowaves.left.and.right" : "checkmark.circle",
+                accessibilityDescription: stateItem.title
+            )
+            submenu.addItem(stateItem)
+            submenu.addItem(NSMenuItem.separator())
+
+            addFirmwareItems(to: submenu, deviceID: deviceID, isConnected: connectedDevice != nil)
+
+            let forgetItem = makeMenuItem(
+                title: "Forget This Device",
+                symbolName: "xmark.circle",
+                action: #selector(forgetConnectedDevice)
+            )
+            forgetItem.representedObject = deviceID
+            submenu.addItem(forgetItem)
+            deviceItem.submenu = submenu
+            menu.addItem(deviceItem)
+        }
+
+        menu.addItem(NSMenuItem.separator())
+    }
+
+    private func addFirmwareItems(to submenu: NSMenu, deviceID: String, isConnected: Bool) {
+        let info = firmwareInfoByDeviceID[deviceID]
+        let currentTitle = info?.currentVersion.map { "Firmware \($0)" } ?? "Firmware Unknown"
+        let currentItem = NSMenuItem(title: currentTitle, action: nil, keyEquivalent: "")
+        currentItem.isEnabled = false
+        currentItem.image = Self.symbolImage(named: "info.circle", accessibilityDescription: currentTitle)
+        submenu.addItem(currentItem)
+
+        if info?.isChecking == true {
+            let checkingItem = NSMenuItem(title: "Checking for Updates", action: nil, keyEquivalent: "")
+            checkingItem.isEnabled = false
+            checkingItem.image = Self.symbolImage(named: "arrow.triangle.2.circlepath", accessibilityDescription: "Checking")
+            submenu.addItem(checkingItem)
+            return
+        }
+
+        if let errorMessage = info?.errorMessage {
+            let errorItem = NSMenuItem(title: "Update Check Failed", action: nil, keyEquivalent: "")
+            errorItem.toolTip = errorMessage
+            errorItem.isEnabled = false
+            errorItem.image = Self.symbolImage(named: "exclamationmark.triangle", accessibilityDescription: "Update Check Failed")
+            submenu.addItem(errorItem)
+            return
+        }
+
+        if info?.updateAvailable == true, let latestVersion = info?.latestVersion {
+            let updateItem = makeMenuItem(
+                title: "Update to \(latestVersion)...",
+                symbolName: "square.and.arrow.down",
+                action: #selector(updateFirmwareForDevice)
+            )
+            updateItem.representedObject = deviceID
+            updateItem.isEnabled = isConnected
+            submenu.addItem(updateItem)
+        } else if info?.latestVersion != nil && info?.currentVersion != nil {
+            let upToDateItem = NSMenuItem(title: "Firmware Up to Date", action: nil, keyEquivalent: "")
+            upToDateItem.isEnabled = false
+            upToDateItem.image = Self.symbolImage(named: "checkmark.circle", accessibilityDescription: "Firmware Up to Date")
+            submenu.addItem(upToDateItem)
+        }
     }
 
     func setStatus(_ text: String) {
@@ -300,6 +371,15 @@ final class StatusController {
     @objc private func forgetConnectedDevice(_ sender: NSMenuItem) {
         guard let deviceID = sender.representedObject as? String else { return }
         onForgetDevice?(deviceID)
+    }
+
+    @objc private func updateFirmwareForDevice(_ sender: NSMenuItem) {
+        guard let deviceID = sender.representedObject as? String else { return }
+        onUpdateFirmwareDevice?(deviceID)
+    }
+
+    @objc private func checkFirmwareUpdates() {
+        onCheckFirmwareUpdates?()
     }
 
     @objc private func restoreLastInput() {

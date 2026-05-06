@@ -124,7 +124,6 @@ final class PairDeviceWindowController: NSWindowController, CBCentralManagerDele
         } else {
             devices.append(device)
         }
-        devices.sort { $0.rssi > $1.rssi }
         tableView.reloadData()
         restoreSelection(selectedIdentifier)
         statusLabel.stringValue = devices.isEmpty ? "Scanning" : "\(devices.count) found"

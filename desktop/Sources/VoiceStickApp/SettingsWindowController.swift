@@ -1,31 +1,23 @@
 import AppKit
-import UniformTypeIdentifiers
 
 final class SettingsWindowController: NSWindowController {
     private let providerPopup = NSPopUpButton()
     private let apiKeyField = NSTextField()
     private let resourcePopup = NSPopUpButton()
-    private let pairedDevicesPopup = NSPopUpButton()
     private let autoEnterButton = NSButton(checkboxWithTitle: "Press Return after paste", target: nil, action: nil)
     private let debugAudioButton = NSButton(checkboxWithTitle: "Save debug audio files", target: nil, action: nil)
     private let debugAudioDirectoryField = NSTextField()
     private let statusLabel = NSTextField(labelWithString: "")
-    private let firmwareUpdateButton = NSButton(title: "Update Firmware...", target: nil, action: nil)
-    private var pairDeviceWindowController: PairDeviceWindowController?
-    private var firmwareUpdateWindowController: FirmwareUpdateWindowController?
     private var currentDisplayedProvider: ASRProvider = .volcengine
     private var resourceRow: NSStackView?
     var onConfigChanged: ((AppConfig) -> Void)?
-    var onPairedDevicesChanged: (([String]) -> Void)?
-    var onFirmwareUpdateRequested: ((URL, @escaping (FirmwareUpdateProgress) -> Void, @escaping (Result<Void, Error>) -> Void) -> Void)?
-    var onFirmwareUpdateCancelRequested: (() -> Void)?
 
     private var config: AppConfig
 
     init(config: AppConfig = AppConfig.load()) {
         self.config = config
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 470),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 380),
             styleMask: [.titled, .closable, .miniaturizable],
             backing: .buffered,
             defer: false
@@ -60,11 +52,7 @@ final class SettingsWindowController: NSWindowController {
         contentView.addSubview(stack)
 
         stack.addArrangedSubview(sectionTitle("Device"))
-        stack.addArrangedSubview(row(label: "Paired Devices", control: pairedDevicesRow()))
         stack.addArrangedSubview(row(label: "After Paste", control: autoEnterButton))
-        firmwareUpdateButton.target = self
-        firmwareUpdateButton.action = #selector(chooseFirmwareImage)
-        stack.addArrangedSubview(row(label: "Firmware", control: firmwareUpdateButton))
 
         stack.addArrangedSubview(sectionTitle("ASR"))
         configureProviderPopup()
@@ -134,7 +122,6 @@ final class SettingsWindowController: NSWindowController {
         currentDisplayedProvider = config.asrProvider
         providerPopup.selectItem(withTitle: config.asrProvider.displayName)
         apiKeyField.stringValue = apiKey(for: config.asrProvider)
-        reloadPairedDevices()
         autoEnterButton.state = config.autoEnter ? .on : .off
         debugAudioButton.state = config.debugAudioCache ? .on : .off
         debugAudioDirectoryField.stringValue = config.debugAudioDirectory.path
@@ -199,101 +186,6 @@ final class SettingsWindowController: NSWindowController {
     @objc private func openDebugAudioFolder() {
         let directory = URL(fileURLWithPath: debugAudioDirectoryField.stringValue, isDirectory: true)
         AppConfig.openDebugAudioDirectory(directory)
-    }
-
-    @objc private func chooseFirmwareImage() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.allowsMultipleSelection = false
-        panel.allowedContentTypes = [UTType(filenameExtension: "bin") ?? .data]
-        panel.prompt = "Update"
-        if panel.runModal() != .OK {
-            return
-        }
-        guard let url = panel.url else { return }
-
-        let updateWindow = FirmwareUpdateWindowController(fileName: url.lastPathComponent)
-        updateWindow.onCancel = { [weak self] in
-            self?.onFirmwareUpdateCancelRequested?()
-        }
-        firmwareUpdateWindowController = updateWindow
-        updateWindow.show()
-
-        firmwareUpdateButton.isEnabled = false
-        statusLabel.stringValue = "Firmware update starting..."
-        onFirmwareUpdateRequested?(url, { [weak self] progress in
-            DispatchQueue.main.async {
-                self?.firmwareUpdateWindowController?.update(progress: progress)
-                self?.statusLabel.stringValue = "Firmware \(Int(progress.fraction * 100))%"
-            }
-        }, { [weak self] result in
-            DispatchQueue.main.async {
-                self?.firmwareUpdateButton.isEnabled = true
-                self?.firmwareUpdateWindowController?.finish(result: result)
-                self?.statusLabel.stringValue = ""
-            }
-        })
-    }
-
-    @objc private func pairDevice() {
-        let controller = PairDeviceWindowController(existingDeviceIDs: config.pairedDeviceIDs) { [weak self] deviceID in
-            guard let self else { return }
-            if !self.config.pairedDeviceIDs.contains(deviceID) {
-                self.config.pairedDeviceIDs.append(deviceID)
-            }
-            self.reloadPairedDevices()
-            self.savePairedDevices()
-        }
-        pairDeviceWindowController = controller
-        controller.show()
-    }
-
-    @objc private func forgetSelectedDevice() {
-        guard pairedDevicesPopup.indexOfSelectedItem >= 0 else { return }
-        let selected = pairedDevicesPopup.titleOfSelectedItem ?? ""
-        let deviceID = AppConfig.normalizedDeviceID(selected)
-        config.pairedDeviceIDs.removeAll { $0 == deviceID }
-        reloadPairedDevices()
-        savePairedDevices()
-    }
-
-    private func reloadPairedDevices() {
-        pairedDevicesPopup.removeAllItems()
-        if config.pairedDeviceIDs.isEmpty {
-            pairedDevicesPopup.addItem(withTitle: "None")
-            pairedDevicesPopup.isEnabled = false
-        } else {
-            pairedDevicesPopup.addItems(withTitles: config.pairedDeviceIDs.map { "VS-\($0)" })
-            pairedDevicesPopup.isEnabled = true
-        }
-    }
-
-    private func pairedDevicesRow() -> NSView {
-        let stack = NSStackView()
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 8
-
-        pairedDevicesPopup.widthAnchor.constraint(equalToConstant: 220).isActive = true
-
-        let pairButton = NSButton(title: "Pair...", target: self, action: #selector(pairDevice))
-        let forgetButton = NSButton(title: "Forget", target: self, action: #selector(forgetSelectedDevice))
-
-        stack.addArrangedSubview(pairedDevicesPopup)
-        stack.addArrangedSubview(pairButton)
-        stack.addArrangedSubview(forgetButton)
-        return stack
-    }
-
-    private func savePairedDevices() {
-        do {
-            try config.save()
-            onPairedDevicesChanged?(config.pairedDeviceIDs)
-            statusLabel.stringValue = config.pairedDeviceIDs.isEmpty ? "Saved." : "Saved. Connecting..."
-        } catch {
-            statusLabel.stringValue = "Save failed: \(error.localizedDescription)"
-        }
     }
 
     private func selectedProvider() -> ASRProvider {
