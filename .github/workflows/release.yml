@@ -55,15 +55,48 @@ jobs:
           command: |
             idf.py build
             mkdir -p ../dist
+            cp build/voice_stick.bin "../dist/voicestick-firmware-sticks3-ota-${{ steps.ver.outputs.version }}.bin"
             cd build
-            esptool.py --chip esp32s3 merge_bin -o "../../dist/voicestick-firmware-sticks3-merged.bin" @flash_args
+            esptool.py --chip esp32s3 merge_bin -o "../../dist/voicestick-firmware-sticks3-merged-${{ steps.ver.outputs.version }}.bin" @flash_args
 
-      - name: Stage firmware checksums
+      - name: Stage firmware checksums and manifest
         run: |
           set -euo pipefail
           sudo chown -R "$(id -u):$(id -g)" dist
+          version="${{ steps.ver.outputs.version }}"
+          public_base="${ALIYUN_OSS_PUBLIC_BASE_URL:-https://xiaozhi-voice-assistant.oss-cn-shenzhen.aliyuncs.com}"
+          prefix="${ALIYUN_OSS_PREFIX:-voicestick/firmwares}"
+          public_base="${public_base%/}"
+          prefix="${prefix#/}"
+          prefix="${prefix%/}"
+          ota="voicestick-firmware-sticks3-ota-${version}.bin"
+          merged="voicestick-firmware-sticks3-merged-${version}.bin"
           cd dist
-          shasum -a 256 "voicestick-firmware-sticks3-merged.bin" > "voicestick-firmware-sticks3-merged.bin.sha256"
+          shasum -a 256 "${ota}" > "${ota}.sha256"
+          shasum -a 256 "${merged}" > "${merged}.sha256"
+          ota_sha="$(awk '{print $1}' "${ota}.sha256")"
+          merged_sha="$(awk '{print $1}' "${merged}.sha256")"
+          ota_size="$(wc -c < "${ota}" | tr -d ' ')"
+          merged_size="$(wc -c < "${merged}" | tr -d ' ')"
+          python3 - <<PY
+          import json
+          manifest = {
+              "hardware": "stick_s3",
+              "version": "${version}",
+              "ota_url": "${public_base}/${prefix}/${version}/${ota}",
+              "ota_sha256": "${ota_sha}",
+              "ota_size": int("${ota_size}"),
+              "merged_url": "${public_base}/${prefix}/${version}/${merged}",
+              "merged_sha256": "${merged_sha}",
+              "merged_size": int("${merged_size}"),
+          }
+          with open("manifest.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          PY
+        env:
+          ALIYUN_OSS_PUBLIC_BASE_URL: ${{ vars.ALIYUN_OSS_PUBLIC_BASE_URL }}
+          ALIYUN_OSS_PREFIX: ${{ vars.ALIYUN_OSS_PREFIX }}
 
       - name: Upload firmware to Aliyun OSS
         env:
@@ -86,8 +119,8 @@ jobs:
           prefix="${prefix#/}"
           prefix="${prefix%/}"
           version="${{ steps.ver.outputs.version }}"
-          firmware="voicestick-firmware-sticks3-merged.bin"
-          checksum="${firmware}.sha256"
+          ota="voicestick-firmware-sticks3-ota-${version}.bin"
+          merged="voicestick-firmware-sticks3-merged-${version}.bin"
 
           ossutil config \
             -e "$ALIYUN_OSS_ENDPOINT" \
@@ -95,10 +128,10 @@ jobs:
             -k "$ALIYUN_OSS_ACCESS_KEY_SECRET" \
             -L EN
 
-          ossutil cp -f "dist/${firmware}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/${version}/${firmware}"
-          ossutil cp -f "dist/${checksum}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/${version}/${checksum}"
-          ossutil cp -f "dist/${firmware}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/latest/${firmware}"
-          ossutil cp -f "dist/${checksum}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/latest/${checksum}"
+          for file in "${ota}" "${ota}.sha256" "${merged}" "${merged}.sha256" "manifest.json"; do
+            ossutil cp -f "dist/${file}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/${version}/${file}"
+            ossutil cp -f "dist/${file}" "oss://${ALIYUN_OSS_BUCKET}/${prefix}/latest/${file}"
+          done
 
       - name: Upload firmware artifact
         uses: actions/upload-artifact@v4

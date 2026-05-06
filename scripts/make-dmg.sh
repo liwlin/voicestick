@@ -3,8 +3,8 @@
 #
 # Usage:
 #   scripts/make-dmg.sh
-#   scripts/make-dmg.sh build/VoiceStick-0.2.0.app
-#   scripts/make-dmg.sh build/VoiceStick-0.2.0.app build/VoiceStick-0.2.0.dmg
+#   scripts/make-dmg.sh build/VoiceStick-<version>.app
+#   scripts/make-dmg.sh build/VoiceStick-<version>.app build/VoiceStick-<version>.dmg
 
 set -euo pipefail
 
