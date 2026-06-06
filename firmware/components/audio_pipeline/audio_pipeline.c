@@ -1,9 +1,12 @@
 #include "audio_pipeline.h"
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdatomic.h>
 #include <string.h>
 
+#include "driver/i2s_common.h"
+#include "driver/i2s_pdm.h"
 #include "driver/i2s_std.h"
 #include "esp_check.h"
 #include "esp_codec_dev.h"
@@ -15,7 +18,7 @@
 #include "hal/i2s_types.h"
 #include "opus.h"
 
-#include "stick_s3_board.h"
+#include "voice_board.h"
 #include "voice_ble.h"
 
 static const char *TAG = "audio_pipeline";
@@ -49,6 +52,7 @@ static uint32_t s_seq;
 static TaskHandle_t s_audio_task;
 static TaskHandle_t s_tx_task;
 static QueueHandle_t s_tx_queue;
+static const voice_board_audio_config_t *s_audio_config;
 
 /* Per-session resources: created on start, destroyed on stop */
 static i2s_chan_handle_t s_rx_handle;
@@ -80,39 +84,64 @@ static esp_err_t wait_for_tasks_to_exit(TickType_t timeout_ticks)
 
 static esp_err_t init_i2s(void)
 {
-    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
+    s_audio_config = voice_board_audio_config();
+    ESP_RETURN_ON_FALSE(s_audio_config != NULL, ESP_ERR_INVALID_STATE, TAG, "audio config unavailable");
+
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(s_audio_config->i2s_port, I2S_ROLE_MASTER);
     chan_cfg.auto_clear = true;
     ESP_RETURN_ON_ERROR(i2s_new_channel(&chan_cfg, NULL, &s_rx_handle),
                         TAG, "create i2s channel");
 
-    i2s_std_config_t std_cfg = {
-        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
-        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
-                                                        I2S_SLOT_MODE_MONO),
-        .gpio_cfg = {
-            .mclk = STICK_S3_PIN_ES8311_MCLK,
-            .bclk = STICK_S3_PIN_ES8311_BCLK,
-            .ws = STICK_S3_PIN_ES8311_LRCK,
-            .dout = STICK_S3_PIN_ES8311_DIN,
-            .din = STICK_S3_PIN_ES8311_DOUT,
-            .invert_flags = {
-                .mclk_inv = false,
-                .bclk_inv = false,
-                .ws_inv = false,
+    if (s_audio_config->kind == VOICE_BOARD_AUDIO_PDM) {
+        i2s_pdm_rx_config_t pdm_cfg = {
+            .clk_cfg = I2S_PDM_RX_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+            .slot_cfg = I2S_PDM_RX_SLOT_PCM_FMT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                               I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .clk = s_audio_config->pdm_clk_gpio,
+                .din = s_audio_config->pdm_din_gpio,
+                .invert_flags = {
+                    .clk_inv = false,
+                },
             },
-        },
-    };
-    std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
+        };
+        ESP_RETURN_ON_ERROR(i2s_channel_init_pdm_rx_mode(s_rx_handle, &pdm_cfg),
+                            TAG, "init pdm rx");
+    } else {
+        i2s_std_config_t std_cfg = {
+            .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(AUDIO_SAMPLE_RATE),
+            .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_16BIT,
+                                                            I2S_SLOT_MODE_MONO),
+            .gpio_cfg = {
+                .mclk = s_audio_config->mclk_gpio,
+                .bclk = s_audio_config->bclk_gpio,
+                .ws = s_audio_config->ws_gpio,
+                .dout = s_audio_config->dout_gpio,
+                .din = s_audio_config->din_gpio,
+                .invert_flags = {
+                    .mclk_inv = false,
+                    .bclk_inv = false,
+                    .ws_inv = false,
+                },
+            },
+        };
+        std_cfg.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;
 
-    ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx_handle, &std_cfg),
-                        TAG, "init i2s rx");
+        ESP_RETURN_ON_ERROR(i2s_channel_init_std_mode(s_rx_handle, &std_cfg),
+                            TAG, "init i2s rx");
+    }
+
     ESP_RETURN_ON_ERROR(i2s_channel_enable(s_rx_handle), TAG, "enable i2s rx");
     return ESP_OK;
 }
 
 static esp_err_t init_codec(void)
 {
-    i2c_master_bus_handle_t i2c_bus = stick_s3_board_i2c_bus();
+    if (s_audio_config->kind != VOICE_BOARD_AUDIO_ES8311) {
+        return ESP_OK;
+    }
+
+    i2c_master_bus_handle_t i2c_bus = voice_board_i2c_bus();
     ESP_RETURN_ON_FALSE(i2c_bus != NULL, ESP_ERR_INVALID_STATE, TAG, "i2c bus unavailable");
 
     audio_codec_i2c_cfg_t i2c_cfg = {
@@ -124,7 +153,7 @@ static esp_err_t init_codec(void)
     ESP_RETURN_ON_FALSE(s_ctrl_if != NULL, ESP_ERR_NO_MEM, TAG, "create codec i2c ctrl");
 
     audio_codec_i2s_cfg_t i2s_cfg = {
-        .port = I2S_NUM_1,
+        .port = s_audio_config->i2s_port,
         .rx_handle = s_rx_handle,
         .tx_handle = NULL,
     };
@@ -226,18 +255,37 @@ static void deinit_codec(void)
 static void deinit_i2s(void)
 {
     if (s_rx_handle) {
-        /* Channel is already disabled by codec close; just release it. */
+        (void)i2s_channel_disable(s_rx_handle);
         i2s_del_channel(s_rx_handle);
         s_rx_handle = NULL;
     }
 }
 
+static void deinit_audio_input(void)
+{
+    deinit_codec();
+    deinit_i2s();
+}
+
 static void deinit_session_resources(void)
 {
     deinit_opus();
-    deinit_codec();
-    deinit_i2s();
+    deinit_audio_input();
     ESP_LOGI(TAG, "session resources released");
+}
+
+static esp_err_t read_audio_frame(int16_t *mono, size_t bytes)
+{
+    if (s_audio_config->kind == VOICE_BOARD_AUDIO_ES8311) {
+        return esp_codec_dev_read(s_codec, mono, bytes);
+    }
+
+    size_t bytes_read = 0;
+    esp_err_t err = i2s_channel_read(s_rx_handle, mono, bytes, &bytes_read, pdMS_TO_TICKS(200));
+    if (err != ESP_OK) {
+        return err;
+    }
+    return bytes_read == bytes ? ESP_OK : ESP_ERR_INVALID_SIZE;
 }
 
 static void audio_task(void *arg)
@@ -249,9 +297,9 @@ static void audio_task(void *arg)
     uint32_t dropped = 0;
 
     while (atomic_load(&s_running)) {
-        esp_err_t err = esp_codec_dev_read(s_codec, mono, sizeof(mono));
+        esp_err_t err = read_audio_frame(mono, sizeof(mono));
         if (err != ESP_OK) {
-            ESP_LOGW(TAG, "codec read failed: %s", esp_err_to_name(err));
+            ESP_LOGW(TAG, "audio read failed: %s", esp_err_to_name(err));
             continue;
         }
 
@@ -392,6 +440,76 @@ esp_err_t audio_pipeline_init(void)
     s_initialized = true;
     ESP_LOGI(TAG, "audio pipeline ready (resources allocated on demand)");
     return ESP_OK;
+}
+
+esp_err_t audio_pipeline_self_test(audio_pipeline_self_test_result_t *result)
+{
+    ESP_RETURN_ON_FALSE(result != NULL, ESP_ERR_INVALID_ARG, TAG, "self-test result required");
+    ESP_RETURN_ON_FALSE(!atomic_load(&s_running), ESP_ERR_INVALID_STATE, TAG, "audio is running");
+    ESP_RETURN_ON_ERROR(wait_for_tasks_to_exit(pdMS_TO_TICKS(TASK_EXIT_WAIT_MS)),
+                        TAG, "wait previous session exit");
+
+    memset(result, 0, sizeof(*result));
+    result->min_sample = INT16_MAX;
+    result->max_sample = INT16_MIN;
+
+    ESP_RETURN_ON_ERROR(init_i2s(), TAG, "self-test i2s init");
+    esp_err_t err = init_codec();
+    if (err != ESP_OK) {
+        deinit_audio_input();
+        ESP_LOGE(TAG, "self-test codec init: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    int16_t mono[AUDIO_FRAME_SAMPLES];
+    int64_t sum_abs = 0;
+    int16_t peak_abs = 0;
+
+    for (uint32_t frame = 0; frame < 11; ++frame) {
+        err = read_audio_frame(mono, sizeof(mono));
+        if (err != ESP_OK) {
+            deinit_audio_input();
+            ESP_LOGE(TAG, "self-test audio read: %s", esp_err_to_name(err));
+            return err;
+        }
+
+        if (frame == 0) {
+            continue;
+        }
+
+        for (size_t i = 0; i < AUDIO_FRAME_SAMPLES; ++i) {
+            const int16_t sample = mono[i];
+            const int16_t abs_sample = sample == INT16_MIN ? INT16_MAX :
+                                       sample < 0 ? (int16_t)-sample : sample;
+            if (sample < result->min_sample) {
+                result->min_sample = sample;
+            }
+            if (sample > result->max_sample) {
+                result->max_sample = sample;
+            }
+            if (abs_sample > peak_abs) {
+                peak_abs = abs_sample;
+            }
+            sum_abs += abs_sample;
+        }
+        result->frames_read++;
+        result->samples_read += AUDIO_FRAME_SAMPLES;
+    }
+
+    deinit_audio_input();
+
+    result->peak_abs = peak_abs;
+    if (result->samples_read > 0) {
+        result->mean_abs = (int32_t)(sum_abs / result->samples_read);
+    } else {
+        result->min_sample = 0;
+        result->max_sample = 0;
+    }
+    ESP_LOGI(TAG, "audio self-test frames=%" PRIu32 " samples=%" PRIu32
+             " mean_abs=%" PRId32 " peak=%d min=%d max=%d",
+             result->frames_read, result->samples_read, result->mean_abs,
+             result->peak_abs, result->min_sample, result->max_sample);
+    return result->samples_read > 0 ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t audio_pipeline_start(uint32_t session_id)

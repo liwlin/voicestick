@@ -17,6 +17,8 @@ Current scope:
 - BLE advertisement scanning through C++/WinRT.
 - Core VoiceStick protocol parsing, Ogg Opus muxing, ASR binary framing, and coordinator state machine.
 - Text insertion through clipboard plus `SendInput`.
+- Optional `wechat_voice_input` output target that maps the VoiceStick primary
+  button to the Ctrl+Win WeChat voice-input hotkey without changing firmware.
 - App self-update checks through WinSparkle, using the same appcast feed as the macOS Sparkle updater.
 
 Full BLE GATT characteristic I/O is intentionally left for follow-up hardware validation work.

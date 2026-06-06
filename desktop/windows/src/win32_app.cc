@@ -33,6 +33,7 @@ constexpr UINT kMenuClickToTalk = 1010;
 constexpr UINT kMenuAutoEnter = 1011;
 constexpr UINT kMenuOutputFocusedApp = 1012;
 constexpr UINT kMenuOutputSubtitle = 1013;
+constexpr UINT kMenuOutputWechatVoiceInput = 1014;
 constexpr UINT kMenuForgetBase = 2100;
 constexpr UINT kMenuForgetEnd = 2199;
 constexpr UINT kMenuUpdateFirmwareBase = 2200;
@@ -461,6 +462,10 @@ LRESULT Win32App::HandleMessage(UINT message, WPARAM w_param, LPARAM l_param) {
             config_.default_output_profile.target = OutputTarget::kSubtitle;
             SaveInputOptions();
             return 0;
+        case kMenuOutputWechatVoiceInput:
+            config_.default_output_profile.target = OutputTarget::kWechatVoiceInput;
+            SaveInputOptions();
+            return 0;
         case kMenuSettings:
             ShowSettings();
             return 0;
@@ -763,6 +768,10 @@ void Win32App::ShowTrayMenu() {
                 MF_STRING | (config_.default_output_profile.target == OutputTarget::kSubtitle ? MF_CHECKED : 0),
                 kMenuOutputSubtitle,
                 L"Subtitle");
+    AppendMenuW(output_menu,
+                MF_STRING | (config_.default_output_profile.target == OutputTarget::kWechatVoiceInput ? MF_CHECKED : 0),
+                kMenuOutputWechatVoiceInput,
+                L"WeChat Voice Input");
     AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(output_menu), L"Output");
 
     AppendMenuW(menu,

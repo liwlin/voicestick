@@ -34,6 +34,14 @@ void InputInjectorWin::Paste(const std::string& text, bool press_enter) {
     }
 }
 
+void InputInjectorWin::SetWechatVoiceInputHotkeyDown(bool is_down) {
+    if (is_down) {
+        SendCtrlWinDown();
+    } else {
+        SendCtrlWinUp();
+    }
+}
+
 std::wstring InputInjectorWin::Utf16FromUtf8(const std::string& text) {
     const int length = MultiByteToWideChar(CP_UTF8, 0, text.data(), static_cast<int>(text.size()), nullptr, 0);
     if (length <= 0) return {};
@@ -60,6 +68,16 @@ void InputInjectorWin::SendCtrlV() {
 void InputInjectorWin::SendEnter() {
     SendKey(VK_RETURN, true);
     SendKey(VK_RETURN, false);
+}
+
+void InputInjectorWin::SendCtrlWinDown() {
+    SendKey(VK_CONTROL, true);
+    SendKey(VK_LWIN, true, KEYEVENTF_EXTENDEDKEY);
+}
+
+void InputInjectorWin::SendCtrlWinUp() {
+    SendKey(VK_LWIN, false, KEYEVENTF_EXTENDEDKEY);
+    SendKey(VK_CONTROL, false);
 }
 
 } // namespace voicestick

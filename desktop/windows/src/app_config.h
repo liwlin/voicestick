@@ -40,6 +40,7 @@ enum class OverlayPosition {
 enum class OutputTarget {
     kFocusedApp,
     kSubtitle,
+    kWechatVoiceInput,
 };
 
 enum class TextTransform {

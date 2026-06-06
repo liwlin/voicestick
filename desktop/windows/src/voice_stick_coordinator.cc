@@ -98,6 +98,7 @@ void VoiceStickCoordinator::Start() {
 void VoiceStickCoordinator::Shutdown() {
     if (is_shutdown_) return;
     is_shutdown_ = true;
+    ReleaseWechatVoiceInputHotkey();
     ble_->on_connection_change = nullptr;
     ble_->on_connection_error = nullptr;
     ble_->on_scan_error = nullptr;
@@ -121,6 +122,9 @@ void VoiceStickCoordinator::Shutdown() {
 }
 
 void VoiceStickCoordinator::UpdateConfig(AppConfig config) {
+    if (config.default_output_profile.target != OutputTarget::kWechatVoiceInput) {
+        ReleaseWechatVoiceInputHotkey();
+    }
     const bool was_recognizing = asr_started_ || active_session_id_.has_value() ||
                                  !pending_paste_state_.IsIdle() || !subtitle_cycles_.empty();
     if (was_recognizing) {
@@ -323,12 +327,20 @@ void VoiceStickCoordinator::HandleStateEvent(const StateEvent& event, const std:
 
 void VoiceStickCoordinator::HandleButtonDown(const StateEvent& event, const std::string& device_id) {
     if (event.button == "primary") {
+        if (config_.default_output_profile.target == OutputTarget::kWechatVoiceInput) {
+            BeginWechatVoiceInput(device_id);
+            return;
+        }
         HandlePrimaryButtonDown(event.session_id, device_id);
     }
 }
 
 void VoiceStickCoordinator::HandleButtonUp(const StateEvent& event, const std::string& device_id) {
     if (event.button == "primary") {
+        if (config_.default_output_profile.target == OutputTarget::kWechatVoiceInput) {
+            EndWechatVoiceInput(device_id);
+            return;
+        }
         HandlePrimaryButtonUp(device_id);
     } else if (event.button == "secondary") {
         HandleSecondaryButtonClick(device_id);
@@ -337,6 +349,14 @@ void VoiceStickCoordinator::HandleButtonUp(const StateEvent& event, const std::s
 
 void VoiceStickCoordinator::HandleButtonClick(const StateEvent& event, const std::string& device_id) {
     if (event.button == "primary") {
+        if (config_.default_output_profile.target == OutputTarget::kWechatVoiceInput) {
+            if (wechat_voice_input_hotkey_down_) {
+                EndWechatVoiceInput(device_id);
+            } else {
+                BeginWechatVoiceInput(device_id);
+            }
+            return;
+        }
         if (config_.default_output_profile.target == OutputTarget::kSubtitle) {
             if (config_.interaction_mode != InteractionMode::kClickToTalk) {
                 ble_->SendUiState("ready", "", device_id);
@@ -414,6 +434,32 @@ void VoiceStickCoordinator::HandlePrimaryButtonDown(std::optional<std::uint32_t>
     }
     ui_->ShowListening(active_device_id_);
     SendUiStateForActiveDevice("recording");
+}
+
+void VoiceStickCoordinator::BeginWechatVoiceInput(const std::string& device_id) {
+    if (!pending_paste_state_.IsIdle() || active_session_id_.has_value() || IsWaitingForFinalText()) {
+        CancelRecognitionInProgress();
+    }
+    if (!wechat_voice_input_hotkey_down_) {
+        input_injector_->SetWechatVoiceInputHotkeyDown(true);
+        wechat_voice_input_hotkey_down_ = true;
+    }
+    ui_->HideOverlay();
+    ble_->SendUiState("ready", "", device_id);
+    SetSessionState(SessionState::kReady, "wechat_voice_input_hotkey");
+    LogCoordinatorLine("wechat voice input hotkey down VS-" + device_id);
+}
+
+void VoiceStickCoordinator::EndWechatVoiceInput(const std::string& device_id) {
+    ReleaseWechatVoiceInputHotkey();
+    ble_->SendUiState("ready", "", device_id);
+    LogCoordinatorLine("wechat voice input hotkey up VS-" + device_id);
+}
+
+void VoiceStickCoordinator::ReleaseWechatVoiceInputHotkey() {
+    if (!wechat_voice_input_hotkey_down_) return;
+    input_injector_->SetWechatVoiceInputHotkeyDown(false);
+    wechat_voice_input_hotkey_down_ = false;
 }
 
 void VoiceStickCoordinator::HandlePrimaryButtonUp(const std::string& device_id) {

@@ -186,9 +186,13 @@ public:
         pasted_text = text;
         pasted_enter = press_enter;
     }
+    void SetWechatVoiceInputHotkeyDown(bool is_down) override {
+        wechat_voice_hotkey_events.push_back(is_down ? "down" : "up");
+    }
 
     std::string pasted_text;
     bool pasted_enter = false;
+    std::vector<std::string> wechat_voice_hotkey_events;
 };
 
 StateEvent ButtonEvent(const std::string& event,
@@ -423,6 +427,9 @@ void TestAppConfig() {
     assert(profile.transform == TextTransform::kTranslate);
     assert(profile.translation_target == "zh-Hans");
     assert(OutputTargetName(OutputTarget::kFocusedApp) == "focused_app");
+    assert(OutputTargetName(OutputTarget::kWechatVoiceInput) == "wechat_voice_input");
+    assert(OutputTargetFromName("wechat_voice_input") == OutputTarget::kWechatVoiceInput);
+    assert(OutputTargetDisplayName(OutputTarget::kWechatVoiceInput) == "WeChat Voice Input");
     assert(TextTransformFromName("translate") == TextTransform::kTranslate);
     const auto hotwords = ParseHotwordList(" 小智,VoiceStick\r\n小智\n豆包 ");
     assert((hotwords == std::vector<std::string>{"小智", "VoiceStick", "豆包"}));
@@ -637,6 +644,34 @@ void TestCoordinatorSubtitleOutputSkipsPaste() {
     assert(HasUiState(*ble_ptr, "ready", "5A74"));
 }
 
+void TestCoordinatorWechatVoiceProfileTriggersHotkeyWithoutAsr() {
+    auto ble = std::make_unique<FakeBleCentral>();
+    auto* ble_ptr = ble.get();
+    auto asr = std::make_unique<FakeAsrClient>();
+    auto* asr_ptr = asr.get();
+    FakeUi ui;
+    FakeInputInjector input;
+    AppConfig config = AppConfig::Defaults();
+    config.default_output_profile.target = OutputTarget::kWechatVoiceInput;
+    VoiceStickCoordinator coordinator(config, std::move(ble), std::move(asr), &ui, &input);
+    coordinator.Start();
+
+    ble_ptr->on_state_event("5A74", ButtonEvent("button_down", "primary", 21));
+    ble_ptr->on_audio_frame("5A74", AudioDataFrame(21, 1));
+    ble_ptr->on_state_event("5A74", ButtonEvent("button_up", "primary", 21));
+
+    assert((input.wechat_voice_hotkey_events == std::vector<std::string>{"down", "up"}));
+    assert(input.pasted_text.empty());
+    assert(!asr_ptr->started);
+    assert(asr_ptr->sent_chunks == 0);
+    assert(ui.show_listening_count == 0);
+    const auto ready_count = std::count_if(
+        ble_ptr->sent_ui_states.begin(), ble_ptr->sent_ui_states.end(), [](const SentUiState& sent) {
+            return sent.state == "ready" && sent.device_id == std::optional<std::string>("5A74");
+        });
+    assert(ready_count >= 2);
+}
+
 void TestCoordinatorSubtitleFinalDoesNotBlockNextSession() {
     auto ble = std::make_unique<FakeBleCentral>();
     auto* ble_ptr = ble.get();
@@ -836,6 +871,7 @@ int main() {
     TestCoordinatorPrimaryPausesPendingConfirmation();
     TestCoordinatorOtherDeviceDuringRecordingGetsReady();
     TestCoordinatorSubtitleOutputSkipsPaste();
+    TestCoordinatorWechatVoiceProfileTriggersHotkeyWithoutAsr();
     TestCoordinatorSubtitleFinalDoesNotBlockNextSession();
     TestCoordinatorShortSubtitleEndReturnsReady();
     TestCoordinatorClickToTalkPrimaryClickTogglesRecording();

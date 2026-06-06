@@ -26,6 +26,8 @@
 #include "services/gap/ble_svc_gap.h"
 #include "services/gatt/ble_svc_gatt.h"
 
+#include "voice_board.h"
+
 static const char *TAG = "voice_ble";
 
 #define OTA_PROGRESS_NOTIFY_BYTES (32 * 1024)
@@ -905,15 +907,16 @@ esp_err_t voice_ble_send_device_info(void)
 {
     const esp_app_desc_t *app_desc = esp_app_get_description();
     const char *version = app_desc ? app_desc->version : "unknown";
+    const char *hardware = voice_board_hardware_id();
     char json[280];
     snprintf(json, sizeof(json),
-             "{\"event\":\"device_info\",\"hardware\":\"stick_s3\","
+             "{\"event\":\"device_info\",\"hardware\":\"%s\","
              "\"firmware_version\":\"%s\","
              "\"buttons\":[\"primary\",\"secondary\"],"
              "\"interaction_modes\":[\"hold_to_talk\",\"click_to_talk\"],"
              "\"ui_states\":[\"ready\",\"recording\",\"thinking\","
              "\"pending_confirmation\",\"error\"]}",
-             version);
+             hardware, version);
     return send_state_json(json);
 }
 

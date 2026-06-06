@@ -1,4 +1,5 @@
 #include <stdbool.h>
+#include <inttypes.h>
 #include <stdint.h>
 #include <string.h>
 
@@ -19,8 +20,8 @@
 #include "iot_button.h"
 
 #include "audio_pipeline.h"
-#include "stick_s3_board.h"
 #include "ui_status.h"
+#include "voice_board.h"
 #include "voice_ble.h"
 
 static const char *TAG = "voice_stick";
@@ -50,6 +51,7 @@ static uint32_t s_session_id = 1;
 static QueueHandle_t s_app_event_queue;
 static button_handle_t s_front_button;
 static button_handle_t s_side_button;
+static gpio_num_t s_power_irq_gpio = GPIO_NUM_NC;
 static int64_t s_primary_down_us;
 static int64_t s_secondary_down_us;
 static uint32_t s_primary_session_id;
@@ -119,6 +121,57 @@ static void queue_app_event(app_event_type_t type);
 static void queue_app_event_with_ota(app_event_type_t type, uint32_t written, uint32_t size);
 static void queue_ui_state_event(const char *state, const char *text);
 static void apply_interaction_mode(interaction_mode_t mode);
+
+#if CONFIG_VOICESTICK_BUTTON_DIAGNOSTIC_ON_BOOT
+static void button_diagnostic_task(void *arg)
+{
+    (void)arg;
+
+    bool last_primary = voice_board_primary_button_pressed();
+    bool last_secondary = voice_board_secondary_button_pressed();
+    ESP_LOGI(TAG, "button diag start primary=%d secondary=%d", last_primary, last_secondary);
+
+    const int64_t deadline_us = esp_timer_get_time() + 45 * 1000 * 1000LL;
+    while (esp_timer_get_time() < deadline_us) {
+        const bool primary = voice_board_primary_button_pressed();
+        const bool secondary = voice_board_secondary_button_pressed();
+        if (primary != last_primary || secondary != last_secondary) {
+            ESP_LOGI(TAG, "button diag primary=%d secondary=%d", primary, secondary);
+            last_primary = primary;
+            last_secondary = secondary;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    ESP_LOGI(TAG, "button diag done");
+    vTaskDelete(NULL);
+}
+#endif
+
+#if CONFIG_VOICESTICK_BLE_AUDIO_E2E_TEST_ON_BOOT
+static void ble_audio_e2e_test_task(void *arg)
+{
+    (void)arg;
+
+    ESP_LOGI(TAG, "BLE audio e2e test waiting for subscriptions");
+    const int64_t deadline_us = esp_timer_get_time() + 60 * 1000 * 1000LL;
+    while (!voice_ble_is_ready() && esp_timer_get_time() < deadline_us) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+
+    if (!voice_ble_is_ready()) {
+        ESP_LOGE(TAG, "BLE audio e2e test timed out waiting for BLE ready");
+        vTaskDelete(NULL);
+    }
+
+    ESP_LOGI(TAG, "BLE audio e2e test simulating primary button hold");
+    queue_app_event(APP_EVENT_FRONT_DOWN);
+    vTaskDelay(pdMS_TO_TICKS(1800));
+    queue_app_event(APP_EVENT_FRONT_UP);
+    ESP_LOGI(TAG, "BLE audio e2e test queued primary button release");
+    vTaskDelete(NULL);
+}
+#endif
 
 static bool is_external_powered(void)
 {
@@ -262,9 +315,9 @@ static void enter_deep_sleep(void)
 
     bool charging = false;
     bool usb_powered = false;
-    esp_err_t power_err = stick_s3_board_battery_charging(&charging);
+    esp_err_t power_err = voice_board_battery_charging(&charging);
     if (power_err == ESP_OK) {
-        power_err = stick_s3_board_usb_powered(&usb_powered);
+        power_err = voice_board_usb_powered(&usb_powered);
     }
     if (power_err == ESP_OK && (charging || usb_powered)) {
         s_battery_charging = charging;
@@ -275,7 +328,12 @@ static void enter_deep_sleep(void)
         return;
     }
 
-    const gpio_num_t wake_gpio = STICK_S3_PIN_BUTTON_FRONT;
+    const gpio_num_t wake_gpio = voice_board_deep_sleep_wake_gpio();
+    if (wake_gpio == GPIO_NUM_NC) {
+        ESP_LOGI(TAG, "board has no deep sleep wake GPIO");
+        restart_deep_sleep_timer();
+        return;
+    }
     if (!esp_sleep_is_valid_wakeup_gpio(wake_gpio)) {
         ESP_LOGE(TAG, "GPIO%d cannot wake from deep sleep", wake_gpio);
         restart_deep_sleep_timer();
@@ -283,17 +341,17 @@ static void enter_deep_sleep(void)
     }
 
     if (gpio_get_level(wake_gpio) == 0) {
-        ESP_LOGI(TAG, "skip deep sleep: front button is pressed");
+        ESP_LOGI(TAG, "skip deep sleep: wake button is pressed");
         restart_deep_sleep_timer();
         return;
     }
 
-    ESP_LOGI(TAG, "entering deep sleep, wake on front button GPIO%d low (level=%d)",
+    ESP_LOGI(TAG, "entering deep sleep, wake on GPIO%d low (level=%d)",
              wake_gpio, gpio_get_level(wake_gpio));
     release_recording_pm_locks();
     ESP_ERROR_CHECK_WITHOUT_ABORT(ui_status_set_brightness(0));
     ui_status_prepare_deep_sleep();
-    stick_s3_board_prepare_deep_sleep();
+    voice_board_prepare_deep_sleep();
 
     /* Clear any stale wakeup source bits left over from light sleep / esp_pm
        configuration (e.g. gpio_wakeup_enable on the PMIC IRQ line). Without
@@ -302,13 +360,17 @@ static void enter_deep_sleep(void)
 
     /* Keep RTC peripherals powered so the internal pull-up on the wake pin
        remains effective in deep sleep; combined with the explicit RTC pull-up
-       below this prevents GPIO%d from floating low and self-waking. */
+       below this prevents the wake GPIO from floating low and self-waking. */
     (void)esp_sleep_pd_config(ESP_PD_DOMAIN_RTC_PERIPH, ESP_PD_OPTION_ON);
     (void)rtc_gpio_pulldown_dis(wake_gpio);
     (void)rtc_gpio_pullup_en(wake_gpio);
 
-    esp_err_t err = esp_sleep_enable_ext1_wakeup_io(1ULL << wake_gpio,
-                                                    ESP_EXT1_WAKEUP_ANY_LOW);
+#if CONFIG_IDF_TARGET_ESP32
+    const esp_sleep_ext1_wakeup_mode_t wake_mode = ESP_EXT1_WAKEUP_ALL_LOW;
+#else
+    const esp_sleep_ext1_wakeup_mode_t wake_mode = ESP_EXT1_WAKEUP_ANY_LOW;
+#endif
+    esp_err_t err = esp_sleep_enable_ext1_wakeup_io(1ULL << wake_gpio, wake_mode);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "enable deep sleep wake failed: %s", esp_err_to_name(err));
         restart_deep_sleep_timer();
@@ -324,7 +386,7 @@ static void enter_deep_sleep(void)
         wait_ms += 10;
     }
     if (gpio_get_level(wake_gpio) == 0) {
-        ESP_LOGW(TAG, "front button still low after %d ms, abort deep sleep", wait_ms);
+        ESP_LOGW(TAG, "wake GPIO still low after %d ms, abort deep sleep", wait_ms);
         restart_deep_sleep_timer();
         return;
     }
@@ -687,7 +749,9 @@ static void app_event_task(void *arg)
             ui_status_set_pairing(voice_ble_device_name());
             break;
         case APP_EVENT_POWER_IRQ:
-            gpio_intr_enable(STICK_S3_PIN_PMIC_IRQ);
+            if (s_power_irq_gpio != GPIO_NUM_NC) {
+                gpio_intr_enable(s_power_irq_gpio);
+            }
             /* fall through */
         case APP_EVENT_BATTERY_REFRESH:
             update_battery_status();
@@ -741,7 +805,8 @@ static esp_err_t init_gpio_button(gpio_num_t gpio_num, button_handle_t *button)
     const button_gpio_config_t gpio_config = {
         .gpio_num = gpio_num,
         .active_level = 0,
-        .enable_power_save = true
+        .enable_power_save = true,
+        .disable_pull = !voice_board_buttons_use_internal_pullups(),
     };
 
     return iot_button_new_gpio_device(&button_config, &gpio_config, button);
@@ -754,11 +819,11 @@ static esp_err_t init_buttons(void)
         return ESP_ERR_NO_MEM;
     }
 
-    esp_err_t err = init_gpio_button(STICK_S3_PIN_BUTTON_FRONT, &s_front_button);
+    esp_err_t err = init_gpio_button(voice_board_primary_button_gpio(), &s_front_button);
     if (err != ESP_OK) {
         return err;
     }
-    err = init_gpio_button(STICK_S3_PIN_BUTTON_SIDE, &s_side_button);
+    err = init_gpio_button(voice_board_secondary_button_gpio(), &s_side_button);
     if (err != ESP_OK) {
         return err;
     }
@@ -867,7 +932,7 @@ static esp_err_t init_battery_refresh_timer(void)
 static void IRAM_ATTR pmic_irq_isr(void *arg)
 {
     (void)arg;
-    gpio_intr_disable(STICK_S3_PIN_PMIC_IRQ);
+    gpio_intr_disable(s_power_irq_gpio);
 
     BaseType_t high_task_woken = pdFALSE;
     queue_app_event_from_isr(APP_EVENT_POWER_IRQ, &high_task_woken);
@@ -878,8 +943,14 @@ static void IRAM_ATTR pmic_irq_isr(void *arg)
 
 static esp_err_t init_pmic_irq(void)
 {
+    s_power_irq_gpio = voice_board_power_irq_gpio();
+    if (s_power_irq_gpio == GPIO_NUM_NC) {
+        ESP_LOGI(TAG, "board has no PMIC IRQ GPIO");
+        return ESP_OK;
+    }
+
     gpio_config_t irq_config = {
-        .pin_bit_mask = 1ULL << STICK_S3_PIN_PMIC_IRQ,
+        .pin_bit_mask = 1ULL << s_power_irq_gpio,
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
@@ -890,7 +961,7 @@ static esp_err_t init_pmic_irq(void)
         return err;
     }
 
-    err = gpio_wakeup_enable(STICK_S3_PIN_PMIC_IRQ, GPIO_INTR_LOW_LEVEL);
+    err = gpio_wakeup_enable(s_power_irq_gpio, GPIO_INTR_LOW_LEVEL);
     if (err != ESP_OK) {
         return err;
     }
@@ -900,16 +971,16 @@ static esp_err_t init_pmic_irq(void)
         return err;
     }
 
-    err = gpio_isr_handler_add(STICK_S3_PIN_PMIC_IRQ, pmic_irq_isr, NULL);
+    err = gpio_isr_handler_add(s_power_irq_gpio, pmic_irq_isr, NULL);
     if (err != ESP_OK) {
         return err;
     }
 
-    err = gpio_set_intr_type(STICK_S3_PIN_PMIC_IRQ, GPIO_INTR_LOW_LEVEL);
+    err = gpio_set_intr_type(s_power_irq_gpio, GPIO_INTR_LOW_LEVEL);
     if (err != ESP_OK) {
         return err;
     }
-    err = gpio_intr_enable(STICK_S3_PIN_PMIC_IRQ);
+    err = gpio_intr_enable(s_power_irq_gpio);
     if (err != ESP_OK) {
         return err;
     }
@@ -920,7 +991,7 @@ static esp_err_t init_pmic_irq(void)
 static void update_battery_status(void)
 {
     uint8_t sys_status = 0;
-    esp_err_t irq_err = stick_s3_board_clear_power_irqs(&sys_status);
+    esp_err_t irq_err = voice_board_clear_power_irqs(&sys_status);
     if (irq_err == ESP_OK && sys_status) {
         ESP_LOGI(TAG, "PMIC sys irq=0x%02x", sys_status);
     }
@@ -928,12 +999,12 @@ static void update_battery_status(void)
     int level = 0;
     bool charging = false;
     bool usb_powered = false;
-    esp_err_t err = stick_s3_board_battery_level(&level);
+    esp_err_t err = voice_board_battery_level(&level);
     if (err == ESP_OK) {
-        err = stick_s3_board_battery_charging(&charging);
+        err = voice_board_battery_charging(&charging);
     }
     if (err == ESP_OK) {
-        err = stick_s3_board_usb_powered(&usb_powered);
+        err = voice_board_usb_powered(&usb_powered);
     }
     if (err == ESP_OK) {
         const bool external_power_changed = (charging != s_battery_charging) ||
@@ -958,7 +1029,7 @@ void app_main(void)
              (unsigned long long)esp_sleep_get_ext1_wakeup_status());
 
     ESP_ERROR_CHECK(init_power_management());
-    ESP_ERROR_CHECK(stick_s3_board_init());
+    ESP_ERROR_CHECK(voice_board_init());
     ESP_ERROR_CHECK(ui_status_init());
     ESP_ERROR_CHECK(init_display_dim_timer());
     ESP_ERROR_CHECK(init_deep_sleep_timer());
@@ -968,6 +1039,14 @@ void app_main(void)
     voice_ble_set_control_callback(ble_control_cb);
     voice_ble_set_ota_callback(ble_ota_cb);
     ESP_ERROR_CHECK(init_buttons());
+#if CONFIG_VOICESTICK_BUTTON_DIAGNOSTIC_ON_BOOT
+    ESP_ERROR_CHECK(xTaskCreate(button_diagnostic_task, "button_diag", 2048,
+                                NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#endif
+#if CONFIG_VOICESTICK_BLE_AUDIO_E2E_TEST_ON_BOOT
+    ESP_ERROR_CHECK(xTaskCreate(ble_audio_e2e_test_task, "ble_audio_e2e", 4096,
+                                NULL, 5, NULL) == pdPASS ? ESP_OK : ESP_ERR_NO_MEM);
+#endif
 
     esp_err_t err = voice_ble_init();
     if (err != ESP_OK) {
@@ -982,6 +1061,23 @@ void app_main(void)
         ESP_LOGE(TAG, "audio init failed: %s", esp_err_to_name(audio_err));
         ui_status_set_error("Audio init failed");
     }
+#if CONFIG_VOICESTICK_AUDIO_SELF_TEST_ON_BOOT
+    if (audio_err == ESP_OK) {
+        audio_pipeline_self_test_result_t self_test = {0};
+        audio_err = audio_pipeline_self_test(&self_test);
+        if (audio_err == ESP_OK) {
+            ESP_LOGI(TAG, "audio self-test ok frames=%" PRIu32
+                     " samples=%" PRIu32 " mean_abs=%" PRId32
+                     " peak=%d min=%d max=%d",
+                     self_test.frames_read, self_test.samples_read,
+                     self_test.mean_abs, self_test.peak_abs,
+                     self_test.min_sample, self_test.max_sample);
+        } else {
+            ESP_LOGE(TAG, "audio self-test failed: %s", esp_err_to_name(audio_err));
+            ui_status_set_error("Audio self-test failed");
+        }
+    }
+#endif
 
     if (err == ESP_OK) {
         ui_status_set_pairing(voice_ble_device_name());
@@ -992,7 +1088,7 @@ void app_main(void)
     ESP_ERROR_CHECK(init_battery_refresh_timer());
     ESP_ERROR_CHECK(init_pmic_irq());
 
-    ESP_LOGI(TAG, "configuring PMIC");
+    ESP_LOGI(TAG, "configuring power management");
     esp_pm_config_t pm_config = {
         .max_freq_mhz = CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ,
         .min_freq_mhz = CONFIG_XTAL_FREQ,

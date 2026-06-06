@@ -1,12 +1,32 @@
-#include "stick_s3_board.h"
+#include "voice_board.h"
 
-#include "driver/i2c_master.h"
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "esp_log.h"
 
-static const char *TAG = "stick_s3_board";
+static const char *TAG = "voice_board_stick_s3";
 static i2c_master_bus_handle_t s_i2c_bus;
 static i2c_master_dev_handle_t s_pmic_dev;
+
+#define STICK_S3_PIN_BUTTON_FRONT 11
+#define STICK_S3_PIN_BUTTON_SIDE  12
+#define STICK_S3_PIN_PMIC_IRQ     13
+
+#define STICK_S3_PIN_I2C_SCL 48
+#define STICK_S3_PIN_I2C_SDA 47
+
+#define STICK_S3_PIN_ES8311_MCLK 18
+#define STICK_S3_PIN_ES8311_BCLK 17
+#define STICK_S3_PIN_ES8311_LRCK 15
+#define STICK_S3_PIN_ES8311_DIN  14
+#define STICK_S3_PIN_ES8311_DOUT 16
+
+#define STICK_S3_PIN_LCD_MOSI 39
+#define STICK_S3_PIN_LCD_SCK  40
+#define STICK_S3_PIN_LCD_DC   45
+#define STICK_S3_PIN_LCD_CS   41
+#define STICK_S3_PIN_LCD_RST  21
+#define STICK_S3_PIN_LCD_BL   38
 
 #define STICK_S3_I2C_FREQ_HZ 100000
 
@@ -34,10 +54,39 @@ static i2c_master_dev_handle_t s_pmic_dev;
 #define M5PM1_HOLD_CFG_LDO_HOLD BIT(5)
 #define M5PM1_GPIO2_L3B_POWER_EN BIT(2)
 #define M5PM1_GPIO_FUNC_MASK(pin) (0x03 << ((pin) * 2))
-#define M5PM1_GPIO_FUNC_GPIO(pin) (0x00 << ((pin) * 2))
 #define M5PM1_GPIO_FUNC_IRQ(pin)  (0x01 << ((pin) * 2))
 #define M5PM1_IRQ_SYS_5VIN_INSERT BIT(0)
 #define M5PM1_IRQ_SYS_5VIN_REMOVE BIT(1)
+
+static const voice_board_lcd_config_t s_lcd_config = {
+    .spi_host = SPI2_HOST,
+    .h_res = 135,
+    .v_res = 240,
+    .x_gap = 52,
+    .y_gap = 40,
+    .mosi_gpio = STICK_S3_PIN_LCD_MOSI,
+    .sclk_gpio = STICK_S3_PIN_LCD_SCK,
+    .dc_gpio = STICK_S3_PIN_LCD_DC,
+    .cs_gpio = STICK_S3_PIN_LCD_CS,
+    .reset_gpio = STICK_S3_PIN_LCD_RST,
+    .backlight_gpio = STICK_S3_PIN_LCD_BL,
+    .backlight_mode = VOICE_BOARD_BACKLIGHT_PWM,
+    .invert_color = true,
+    .mirror_x = false,
+    .mirror_y = false,
+};
+
+static const voice_board_audio_config_t s_audio_config = {
+    .kind = VOICE_BOARD_AUDIO_ES8311,
+    .i2s_port = I2S_NUM_1,
+    .mclk_gpio = STICK_S3_PIN_ES8311_MCLK,
+    .bclk_gpio = STICK_S3_PIN_ES8311_BCLK,
+    .ws_gpio = STICK_S3_PIN_ES8311_LRCK,
+    .dout_gpio = STICK_S3_PIN_ES8311_DIN,
+    .din_gpio = STICK_S3_PIN_ES8311_DOUT,
+    .pdm_clk_gpio = GPIO_NUM_NC,
+    .pdm_din_gpio = GPIO_NUM_NC,
+};
 
 static bool read_active_low_button(gpio_num_t pin)
 {
@@ -148,10 +197,6 @@ static esp_err_t init_i2c(void)
                      candidates[i].port, candidates[i].sda, candidates[i].scl, device_id);
             return ESP_OK;
         }
-
-        ESP_LOGI(TAG, "I2C probe port %d sda=%d scl=%d -> %s",
-                 candidates[i].port, candidates[i].sda, candidates[i].scl,
-                 esp_err_to_name(last_err));
     }
 
     return last_err;
@@ -212,7 +257,7 @@ static void init_pmic(void)
              device_id, pwr_cfg, new_pwr_cfg, hold_cfg, new_hold_cfg);
 }
 
-esp_err_t stick_s3_board_init(void)
+esp_err_t voice_board_init(void)
 {
     esp_err_t err = init_i2c();
     if (err != ESP_OK) {
@@ -232,17 +277,73 @@ esp_err_t stick_s3_board_init(void)
     return gpio_config(&button_config);
 }
 
-bool stick_s3_front_button_pressed(void)
+const char *voice_board_hardware_id(void)
 {
-    return read_active_low_button(STICK_S3_PIN_BUTTON_FRONT);
+    return "stick_s3";
 }
 
-i2c_master_bus_handle_t stick_s3_board_i2c_bus(void)
+const char *voice_board_display_name(void)
+{
+    return "M5Stack StickS3";
+}
+
+i2c_master_bus_handle_t voice_board_i2c_bus(void)
 {
     return s_i2c_bus;
 }
 
-esp_err_t stick_s3_board_battery_voltage_mv(int *voltage_mv)
+const voice_board_lcd_config_t *voice_board_lcd_config(void)
+{
+    return &s_lcd_config;
+}
+
+const voice_board_audio_config_t *voice_board_audio_config(void)
+{
+    return &s_audio_config;
+}
+
+gpio_num_t voice_board_primary_button_gpio(void)
+{
+    return STICK_S3_PIN_BUTTON_FRONT;
+}
+
+gpio_num_t voice_board_secondary_button_gpio(void)
+{
+    return STICK_S3_PIN_BUTTON_SIDE;
+}
+
+gpio_num_t voice_board_power_irq_gpio(void)
+{
+    return STICK_S3_PIN_PMIC_IRQ;
+}
+
+gpio_num_t voice_board_deep_sleep_wake_gpio(void)
+{
+    return STICK_S3_PIN_BUTTON_FRONT;
+}
+
+bool voice_board_buttons_use_internal_pullups(void)
+{
+    return true;
+}
+
+bool voice_board_primary_button_pressed(void)
+{
+    return read_active_low_button(STICK_S3_PIN_BUTTON_FRONT);
+}
+
+bool voice_board_secondary_button_pressed(void)
+{
+    return read_active_low_button(STICK_S3_PIN_BUTTON_SIDE);
+}
+
+esp_err_t voice_board_set_lcd_brightness(uint8_t brightness)
+{
+    (void)brightness;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t voice_board_battery_voltage_mv(int *voltage_mv)
 {
     if (!voltage_mv) {
         return ESP_ERR_INVALID_ARG;
@@ -261,7 +362,7 @@ esp_err_t stick_s3_board_battery_voltage_mv(int *voltage_mv)
     return *voltage_mv > 0 ? ESP_OK : ESP_FAIL;
 }
 
-esp_err_t stick_s3_board_vbus_voltage_mv(int *voltage_mv)
+esp_err_t voice_board_vbus_voltage_mv(int *voltage_mv)
 {
     if (!voltage_mv) {
         return ESP_ERR_INVALID_ARG;
@@ -280,14 +381,14 @@ esp_err_t stick_s3_board_vbus_voltage_mv(int *voltage_mv)
     return ESP_OK;
 }
 
-esp_err_t stick_s3_board_battery_level(int *level_percent)
+esp_err_t voice_board_battery_level(int *level_percent)
 {
     if (!level_percent) {
         return ESP_ERR_INVALID_ARG;
     }
 
     int voltage_mv = 0;
-    esp_err_t err = stick_s3_board_battery_voltage_mv(&voltage_mv);
+    esp_err_t err = voice_board_battery_voltage_mv(&voltage_mv);
     if (err != ESP_OK) {
         return err;
     }
@@ -303,7 +404,7 @@ esp_err_t stick_s3_board_battery_level(int *level_percent)
     return ESP_OK;
 }
 
-esp_err_t stick_s3_board_battery_charging(bool *charging)
+esp_err_t voice_board_battery_charging(bool *charging)
 {
     if (!charging) {
         return ESP_ERR_INVALID_ARG;
@@ -322,14 +423,14 @@ esp_err_t stick_s3_board_battery_charging(bool *charging)
     return ESP_OK;
 }
 
-esp_err_t stick_s3_board_usb_powered(bool *usb_powered)
+esp_err_t voice_board_usb_powered(bool *usb_powered)
 {
     if (!usb_powered) {
         return ESP_ERR_INVALID_ARG;
     }
 
     int voltage_mv = 0;
-    esp_err_t err = stick_s3_board_vbus_voltage_mv(&voltage_mv);
+    esp_err_t err = voice_board_vbus_voltage_mv(&voltage_mv);
     if (err != ESP_OK) {
         return err;
     }
@@ -338,7 +439,7 @@ esp_err_t stick_s3_board_usb_powered(bool *usb_powered)
     return ESP_OK;
 }
 
-esp_err_t stick_s3_board_clear_power_irqs(uint8_t *sys_status)
+esp_err_t voice_board_clear_power_irqs(uint8_t *sys_status)
 {
     if (!s_pmic_dev) {
         return ESP_ERR_INVALID_STATE;
@@ -354,7 +455,7 @@ esp_err_t stick_s3_board_clear_power_irqs(uint8_t *sys_status)
     return ESP_OK;
 }
 
-void stick_s3_board_prepare_deep_sleep(void)
+void voice_board_prepare_deep_sleep(void)
 {
     if (!s_pmic_dev) {
         return;
@@ -364,9 +465,4 @@ void stick_s3_board_prepare_deep_sleep(void)
                                                   M5PM1_GPIO2_L3B_POWER_EN, 0));
     ESP_ERROR_CHECK_WITHOUT_ABORT(pmic_update_reg(M5PM1_REG_GPIO_DRV,
                                                   M5PM1_GPIO2_L3B_POWER_EN, 0));
-}
-
-bool stick_s3_side_button_pressed(void)
-{
-    return read_active_low_button(STICK_S3_PIN_BUTTON_SIDE);
 }

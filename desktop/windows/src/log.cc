@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <mutex>
 #include <sstream>
 
 namespace voicestick {
@@ -30,10 +31,16 @@ std::filesystem::path LogFilePath() {
     return AppConfig::DefaultDebugAudioDirectory().parent_path() / "VoiceStickApp.log";
 }
 
+std::mutex& LogMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
 } // namespace
 
 void Log(std::string_view category, std::string_view message) {
     try {
+        std::lock_guard lock(LogMutex());
         const auto path = LogFilePath();
         std::filesystem::create_directories(path.parent_path());
         std::ofstream output(path, std::ios::app);

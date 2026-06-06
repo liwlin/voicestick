@@ -1,0 +1,17 @@
+menu "VoiceStick board"
+
+choice VOICESTICK_BOARD
+    prompt "VoiceStick hardware board"
+    default VOICESTICK_BOARD_STICK_S3
+
+config VOICESTICK_BOARD_STICK_S3
+    bool "M5Stack StickS3"
+    depends on IDF_TARGET_ESP32S3
+
+config VOICESTICK_BOARD_M5STICKC_PLUS
+    bool "M5Stack M5StickC Plus"
+    depends on IDF_TARGET_ESP32
+
+endchoice
+
+endmenu

@@ -20,17 +20,10 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"
-#include "stick_s3_board.h"
 #include "ui_status_icons.h"
+#include "voice_board.h"
 
 static const char *TAG = "ui_status";
-
-#define LCD_HOST SPI2_HOST
-
-#define LCD_H_RES 135
-#define LCD_V_RES 240
-#define LCD_X_GAP 52
-#define LCD_Y_GAP 40
 
 #define LCD_PIXEL_CLOCK_HZ (20 * 1000 * 1000)
 #define LCD_CMD_BITS 8
@@ -54,6 +47,7 @@ static const char *TAG = "ui_status";
 
 static _lock_t s_lvgl_lock;
 static bool s_ready;
+static const voice_board_lcd_config_t *s_lcd_config;
 static lv_display_t *s_display;
 static lv_obj_t *s_screen;
 static lv_obj_t *s_top_label;
@@ -237,13 +231,13 @@ static void create_status_ui(void)
     lv_label_set_text(s_status_label, "Booting");
     lv_obj_set_style_text_font(s_status_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(s_status_label, lv_color_hex(0x3f3440), 0);
-    lv_obj_set_width(s_status_label, LCD_H_RES - 16);
+    lv_obj_set_width(s_status_label, s_lcd_config->h_res - 16);
     lv_obj_set_style_text_align(s_status_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_align(s_status_label, LV_ALIGN_TOP_MID, 0, 168);
 
     s_hint_label = lv_label_create(s_screen);
     lv_label_set_long_mode(s_hint_label, LV_LABEL_LONG_WRAP);
-    lv_obj_set_width(s_hint_label, LCD_H_RES - 16);
+    lv_obj_set_width(s_hint_label, s_lcd_config->h_res - 16);
     lv_obj_set_style_text_align(s_hint_label, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_set_style_text_color(s_hint_label, lv_color_hex(0x7f7180), 0);
     lv_label_set_text(s_hint_label, "Starting up");
@@ -265,57 +259,62 @@ static void set_scene(ui_status_icon_scene_t scene, const char *status, const ch
 
 esp_err_t ui_status_init(void)
 {
-    const ledc_timer_config_t backlight_timer = {
-        .speed_mode = LCD_BACKLIGHT_LEDC_MODE,
-        .duty_resolution = LEDC_TIMER_8_BIT,
-        .timer_num = LCD_BACKLIGHT_LEDC_TIMER,
-        .freq_hz = LCD_BACKLIGHT_PWM_HZ,
-        // RC_FAST clock remains active during light sleep, preventing backlight flicker
-        .clk_cfg = LEDC_USE_RC_FAST_CLK,
-    };
-    ESP_RETURN_ON_ERROR(ledc_timer_config(&backlight_timer), TAG, "configure backlight timer");
+    s_lcd_config = voice_board_lcd_config();
+    ESP_RETURN_ON_FALSE(s_lcd_config != NULL, ESP_ERR_INVALID_STATE, TAG, "lcd config unavailable");
 
-    const ledc_channel_config_t backlight_channel = {
-        .gpio_num = STICK_S3_PIN_LCD_BL,
-        .speed_mode = LCD_BACKLIGHT_LEDC_MODE,
-        .channel = LCD_BACKLIGHT_LEDC_CHANNEL,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LCD_BACKLIGHT_LEDC_TIMER,
-        .duty = 0,
-        .hpoint = 0,
-        .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
-        .flags.output_invert = 0,
-    };
-    ESP_RETURN_ON_ERROR(ledc_channel_config(&backlight_channel), TAG, "configure backlight channel");
+    if (s_lcd_config->backlight_mode == VOICE_BOARD_BACKLIGHT_PWM) {
+        const ledc_timer_config_t backlight_timer = {
+            .speed_mode = LCD_BACKLIGHT_LEDC_MODE,
+            .duty_resolution = LEDC_TIMER_8_BIT,
+            .timer_num = LCD_BACKLIGHT_LEDC_TIMER,
+            .freq_hz = LCD_BACKLIGHT_PWM_HZ,
+            // RC_FAST clock remains active during light sleep, preventing backlight flicker
+            .clk_cfg = LEDC_USE_RC_FAST_CLK,
+        };
+        ESP_RETURN_ON_ERROR(ledc_timer_config(&backlight_timer), TAG, "configure backlight timer");
+
+        const ledc_channel_config_t backlight_channel = {
+            .gpio_num = s_lcd_config->backlight_gpio,
+            .speed_mode = LCD_BACKLIGHT_LEDC_MODE,
+            .channel = LCD_BACKLIGHT_LEDC_CHANNEL,
+            .intr_type = LEDC_INTR_DISABLE,
+            .timer_sel = LCD_BACKLIGHT_LEDC_TIMER,
+            .duty = 0,
+            .hpoint = 0,
+            .sleep_mode = LEDC_SLEEP_MODE_KEEP_ALIVE,
+            .flags.output_invert = 0,
+        };
+        ESP_RETURN_ON_ERROR(ledc_channel_config(&backlight_channel), TAG, "configure backlight channel");
+    }
 
     spi_bus_config_t bus_config = {
-        .sclk_io_num = STICK_S3_PIN_LCD_SCK,
-        .mosi_io_num = STICK_S3_PIN_LCD_MOSI,
+        .sclk_io_num = s_lcd_config->sclk_gpio,
+        .mosi_io_num = s_lcd_config->mosi_gpio,
         .miso_io_num = -1,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = LCD_H_RES * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t),
+        .max_transfer_sz = s_lcd_config->h_res * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t),
     };
-    ESP_RETURN_ON_ERROR(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO),
+    ESP_RETURN_ON_ERROR(spi_bus_initialize(s_lcd_config->spi_host, &bus_config, SPI_DMA_CH_AUTO),
                         TAG, "initialize lcd spi bus");
 
     esp_lcd_panel_io_handle_t io = NULL;
     esp_lcd_panel_io_spi_config_t io_config = {
-        .dc_gpio_num = STICK_S3_PIN_LCD_DC,
-        .cs_gpio_num = STICK_S3_PIN_LCD_CS,
+        .dc_gpio_num = s_lcd_config->dc_gpio,
+        .cs_gpio_num = s_lcd_config->cs_gpio,
         .pclk_hz = LCD_PIXEL_CLOCK_HZ,
         .lcd_cmd_bits = LCD_CMD_BITS,
         .lcd_param_bits = LCD_PARAM_BITS,
         .spi_mode = 0,
         .trans_queue_depth = 10,
     };
-    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)LCD_HOST,
+    ESP_RETURN_ON_ERROR(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)s_lcd_config->spi_host,
                                                  &io_config, &io),
                         TAG, "create lcd panel io");
 
     esp_lcd_panel_handle_t panel = NULL;
     esp_lcd_panel_dev_config_t panel_config = {
-        .reset_gpio_num = STICK_S3_PIN_LCD_RST,
+        .reset_gpio_num = s_lcd_config->reset_gpio,
         .rgb_ele_order = LCD_RGB_ELEMENT_ORDER_RGB,
         .bits_per_pixel = 16,
     };
@@ -323,18 +322,21 @@ esp_err_t ui_status_init(void)
                         TAG, "create st7789 panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_reset(panel), TAG, "reset panel");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_init(panel), TAG, "init panel");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, true), TAG, "invert panel colors");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(panel, false, false), TAG, "mirror panel");
-    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(panel, LCD_X_GAP, LCD_Y_GAP), TAG, "set panel gap");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_invert_color(panel, s_lcd_config->invert_color),
+                        TAG, "invert panel colors");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_mirror(panel, s_lcd_config->mirror_x, s_lcd_config->mirror_y),
+                        TAG, "mirror panel");
+    ESP_RETURN_ON_ERROR(esp_lcd_panel_set_gap(panel, s_lcd_config->x_gap, s_lcd_config->y_gap),
+                        TAG, "set panel gap");
     ESP_RETURN_ON_ERROR(esp_lcd_panel_disp_on_off(panel, true), TAG, "turn display on");
 
     lv_init();
-    s_display = lv_display_create(LCD_H_RES, LCD_V_RES);
+    s_display = lv_display_create(s_lcd_config->h_res, s_lcd_config->v_res);
     ESP_RETURN_ON_FALSE(s_display, ESP_ERR_NO_MEM, TAG, "create lvgl display");
 
-    const size_t draw_buffer_size = LCD_H_RES * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t);
-    void *buf1 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_size, 0);
-    void *buf2 = spi_bus_dma_memory_alloc(LCD_HOST, draw_buffer_size, 0);
+    const size_t draw_buffer_size = s_lcd_config->h_res * LVGL_DRAW_BUF_LINES * sizeof(lv_color16_t);
+    void *buf1 = spi_bus_dma_memory_alloc(s_lcd_config->spi_host, draw_buffer_size, 0);
+    void *buf2 = spi_bus_dma_memory_alloc(s_lcd_config->spi_host, draw_buffer_size, 0);
     ESP_RETURN_ON_FALSE(buf1 && buf2, ESP_ERR_NO_MEM, TAG, "allocate lvgl draw buffers");
 
     lv_display_set_buffers(s_display, buf1, buf2, draw_buffer_size, LV_DISPLAY_RENDER_MODE_PARTIAL);
@@ -373,6 +375,10 @@ esp_err_t ui_status_init(void)
 
 esp_err_t ui_status_set_brightness(uint8_t brightness)
 {
+    if (s_lcd_config && s_lcd_config->backlight_mode == VOICE_BOARD_BACKLIGHT_BOARD) {
+        return voice_board_set_lcd_brightness(brightness);
+    }
+
     ESP_RETURN_ON_ERROR(ledc_set_duty(LCD_BACKLIGHT_LEDC_MODE,
                                       LCD_BACKLIGHT_LEDC_CHANNEL,
                                       brightness),

@@ -125,6 +125,13 @@ std::string FormatHresult(std::int32_t code) {
     return buffer;
 }
 
+winrt::guid VoiceStickUuid(std::uint8_t suffix) {
+    return winrt::guid{0x8f2f0b84,
+                       0x6e6f,
+                       0x4b23,
+                       {0x88, 0xf7, 0x3a, 0x3c, 0xea, 0xfc, 0x51, suffix}};
+}
+
 bool CanReadAdvertisementAddressType() {
     static const bool available =
         winrt::Windows::Foundation::Metadata::ApiInformation::IsPropertyPresent(
@@ -856,7 +863,7 @@ winrt::fire_and_forget BleCentralWin::ConnectDeviceAsync(std::uint64_t bluetooth
                        " count=" + std::to_string(count));
 
             if (status == GattCommunicationStatus::Success && count > 0) {
-                const winrt::guid wanted{BleProtocol::service_uuid};
+                const winrt::guid wanted = VoiceStickUuid(0x00);
                 for (uint32_t i = 0; i < count; ++i) {
                     auto candidate = services.GetAt(i);
                     if (candidate.Uuid() == wanted) {
@@ -955,11 +962,11 @@ winrt::fire_and_forget BleCentralWin::ConnectDeviceAsync(std::uint64_t bluetooth
             return op.GetResults();
         };
 
-        auto audio_result = discover_characteristic(winrt::guid{BleProtocol::audio_uuid}, "audio_tx");
-        auto state_result = discover_characteristic(winrt::guid{BleProtocol::state_uuid}, "state_tx");
-        auto control_result = discover_characteristic(winrt::guid{BleProtocol::control_uuid}, "control_rx");
-        auto ota_rx_result = discover_characteristic(winrt::guid{BleProtocol::ota_rx_uuid}, "ota_rx");
-        auto ota_state_result = discover_characteristic(winrt::guid{BleProtocol::ota_state_uuid}, "ota_state");
+        auto audio_result = discover_characteristic(VoiceStickUuid(0x01), "audio_tx");
+        auto state_result = discover_characteristic(VoiceStickUuid(0x02), "state_tx");
+        auto control_result = discover_characteristic(VoiceStickUuid(0x03), "control_rx");
+        auto ota_rx_result = discover_characteristic(VoiceStickUuid(0x04), "ota_rx");
+        auto ota_state_result = discover_characteristic(VoiceStickUuid(0x05), "ota_state");
         if (!audio_result || audio_result.Status() != GattCommunicationStatus::Success || audio_result.Characteristics().Size() == 0) {
             fail("audio_tx discovery failed: " + (audio_result ? GattStatusName(audio_result.Status()) : std::string("timeout")));
             co_return;
@@ -1003,9 +1010,19 @@ winrt::fire_and_forget BleCentralWin::ConnectDeviceAsync(std::uint64_t bluetooth
                 auto bytes = BytesFromBuffer(args.CharacteristicValue());
                 auto frame = BleProtocol::ParseAudioFrame(bytes);
                 if (frame.has_value()) {
+                    if (frame->seq < 3 || frame->IsStart() || frame->IsEnd()) {
+                        LogBleLine("audio notify VS-" + device_id +
+                                   " session=" + std::to_string(frame->session_id) +
+                                   " seq=" + std::to_string(frame->seq) +
+                                   " flags=" + std::to_string(frame->flags) +
+                                   " payload=" + std::to_string(frame->payload.size()));
+                    }
                     DispatchToUiThread([this, device_id, f = std::move(*frame)]() {
                         if (on_audio_frame) on_audio_frame(device_id, f);
                     });
+                } else {
+                    LogBleLine("audio notify VS-" + device_id +
+                               " parse failed len=" + std::to_string(bytes.size()));
                 }
             });
         session->state_value_changed_token = session->state_characteristic.ValueChanged(

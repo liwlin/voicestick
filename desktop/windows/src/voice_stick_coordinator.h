@@ -122,6 +122,7 @@ class InputInjector {
 public:
     virtual ~InputInjector() = default;
     virtual void Paste(const std::string& text, bool press_enter) = 0;
+    virtual void SetWechatVoiceInputHotkeyDown(bool is_down) = 0;
 };
 
 class VoiceStickCoordinator {
@@ -202,6 +203,9 @@ private:
     void HandleSecondaryButtonClick(const std::string& device_id);
     void HandlePrimaryButtonDown(std::optional<std::uint32_t> session_id, const std::string& device_id);
     void HandlePrimaryButtonUp(const std::string& device_id);
+    void BeginWechatVoiceInput(const std::string& device_id);
+    void EndWechatVoiceInput(const std::string& device_id);
+    void ReleaseWechatVoiceInputHotkey();
     void HandleAudioFrame(const AudioFrame& frame, const std::string& device_id);
     void HandleSubtitlePrimaryButtonDown(std::optional<std::uint32_t> session_id, const std::string& device_id);
     void HandleSubtitlePrimaryButtonUp(const std::string& device_id);
@@ -313,6 +317,7 @@ private:
     std::thread firmware_manifest_thread_;
     bool is_showing_asr_error_ = false;
     bool is_shutdown_ = false;
+    bool wechat_voice_input_hotkey_down_ = false;
     std::map<std::pair<std::string, std::uint32_t>, std::unique_ptr<SubtitleCycle>> subtitle_cycles_;
     std::map<std::string, std::uint32_t> active_subtitle_sessions_;
     static constexpr double kMinimumRecordingDurationSeconds = 0.5;

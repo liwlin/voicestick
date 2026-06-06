@@ -1,0 +1,21 @@
+menu "VoiceStick app diagnostics"
+
+config VOICESTICK_BUTTON_DIAGNOSTIC_ON_BOOT
+    bool "Run raw button GPIO diagnostic on boot"
+    default n
+    help
+        When enabled, firmware logs raw primary/secondary button level changes
+        for a short period after boot. This is intended for bench testing new
+        board ports and is disabled in normal builds.
+
+config VOICESTICK_BLE_AUDIO_E2E_TEST_ON_BOOT
+    bool "Run BLE audio end-to-end diagnostic on boot"
+    default n
+    help
+        When enabled, firmware waits for the BLE central to subscribe to
+        state and audio notifications, then simulates one short primary-button
+        hold to exercise the normal recording and BLE audio path. This is
+        intended for automated bench testing only and is disabled in normal
+        builds.
+
+endmenu

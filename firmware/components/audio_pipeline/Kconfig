@@ -1,0 +1,11 @@
+menu "VoiceStick audio pipeline"
+
+config VOICESTICK_AUDIO_SELF_TEST_ON_BOOT
+    bool "Run audio input self-test on boot"
+    default n
+    help
+        When enabled, firmware reads a short burst of board audio input after
+        boot and logs basic PCM statistics. This is intended for bench testing
+        new board ports and is disabled in normal builds.
+
+endmenu

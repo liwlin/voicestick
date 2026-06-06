@@ -577,15 +577,29 @@ std::string OverlayPositionDisplayName(OverlayPosition position) {
 }
 
 std::string OutputTargetName(OutputTarget target) {
-    return target == OutputTarget::kSubtitle ? "subtitle" : "focused_app";
+    switch (target) {
+    case OutputTarget::kSubtitle: return "subtitle";
+    case OutputTarget::kWechatVoiceInput: return "wechat_voice_input";
+    case OutputTarget::kFocusedApp:
+    default:
+        return "focused_app";
+    }
 }
 
 OutputTarget OutputTargetFromName(std::string_view name) {
-    return name == "subtitle" ? OutputTarget::kSubtitle : OutputTarget::kFocusedApp;
+    if (name == "subtitle") return OutputTarget::kSubtitle;
+    if (name == "wechat_voice_input") return OutputTarget::kWechatVoiceInput;
+    return OutputTarget::kFocusedApp;
 }
 
 std::string OutputTargetDisplayName(OutputTarget target) {
-    return target == OutputTarget::kSubtitle ? "Subtitle" : "Focused App";
+    switch (target) {
+    case OutputTarget::kSubtitle: return "Subtitle";
+    case OutputTarget::kWechatVoiceInput: return "WeChat Voice Input";
+    case OutputTarget::kFocusedApp:
+    default:
+        return "Focused App";
+    }
 }
 
 std::string TextTransformName(TextTransform transform) {
