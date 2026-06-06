@@ -1,8 +1,19 @@
 # Voice Stick
 
-Voice Stick turns an M5Stack StickS3 or M5StickC Plus into a Bluetooth push-to-talk input device for macOS.
+Voice Stick turns an M5Stack device into a Bluetooth push-to-talk input device.
 
-Hold the front button on the StickS3 to record. When you release it, the macOS menu bar app sends the audio to ASR, shows the recognized text, and pastes the final result into the currently focused input field after a short confirmation countdown. By default it pastes text and presses Return; `auto_enter` can be disabled in settings.
+**Current release focus:** `v0.3.4` is the M5StickC Plus / Windows release. It
+packages the tested M5StickC Plus USB firmware bundle and the Windows portable
+desktop app, including the WeChat voice-input output mode.
+
+On M5StickC Plus, press Button A as the primary push-to-talk button. In normal
+VoiceStick ASR mode, the desktop app receives BLE audio and outputs recognized
+text. In the Windows WeChat voice-input mode, Button A holds the Windows
+`Ctrl+Win` shortcut while pressed so WeChat desktop records directly.
+
+The original StickS3/macOS path remains in the repository for compatibility,
+but it is not the primary target of the v0.3.4 package published from this
+workspace.
 
 ## Project Layout
 
@@ -32,8 +43,8 @@ Hold the front button on the StickS3 to record. When you release it, the macOS m
 
 ## User Manual
 
-See `docs/user-manual.md` for Windows setup, pairing, output modes, M5StickC
-Plus flashing, WeChat voice input, and troubleshooting.
+See `docs/user-manual.md` for the M5StickC Plus Windows setup, pairing, output
+modes, USB flashing, WeChat voice input, and troubleshooting.
 
 ## Hardware Targets
 

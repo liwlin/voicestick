@@ -1,8 +1,13 @@
-# VoiceStick 0.3.4 Release Notes
+# VoiceStick 0.3.4 M5StickC Plus Release Notes
+
+This release is targeted at **M5Stack M5StickC Plus on Windows**. It packages
+the tested M5StickC Plus USB firmware bundle and the Windows portable desktop
+app used for formal testing. StickS3 support remains in the source tree, but it
+is not the primary packaged target for this release.
 
 ## Highlights
 
-- Added M5StickC Plus firmware support.
+- Added M5StickC Plus firmware support as the release focus.
 - Added a Windows `WeChat Voice Input` output target.
 - Improved Windows BLE connection diagnostics and stale pairing cleanup.
 - Added board-specific firmware diagnostics for M5StickC Plus bring-up.
@@ -39,9 +44,8 @@ This mode does not start VoiceStick ASR and does not paste text.
   - Unsigned. Run `VoiceStick.exe` from the extracted folder.
 - `voicestick-firmware-m5stickc-plus-0.3.4.zip`
   - M5StickC Plus USB flash bundle.
-- GitHub Actions release assets
-  - macOS app packages.
-  - StickS3 firmware OTA and merged images.
+- StickS3/macOS assets are compatibility outputs when built by the existing
+  automation, not the focus of this v0.3.4 package.
 
 ## Verification
 
